@@ -1,10 +1,13 @@
 """Main GBX parser implementation."""
 
 import os
+import logging
 from typing import Dict, List, Any, Optional
 from .reader import GBXReader
 from .models import Metadata, GhostSample, Vec3
 from .chunks import ChunkParser
+
+logger = logging.getLogger(__name__)
 
 # Try to import pygbx for metadata extraction
 try:
@@ -95,7 +98,7 @@ class GBXParser:
                 
         except Exception as e:
             # If pygbx fails, fall back to custom parsing
-            print(f"Warning: pygbx parsing failed: {e}")
+            logger.warning(f"pygbx parsing failed: {e}, falling back to custom parsing")
             self._parse_custom()
             
     def _parse_custom(self):
@@ -185,7 +188,7 @@ class GBXParser:
                         reader.read_bytes(chunk_size)
                         
         except Exception as e:
-            print(f"Warning: Error parsing metadata chunks: {e}")
+            logger.warning(f"Error parsing metadata chunks: {e}")
             
         return metadata
         

@@ -1,11 +1,7 @@
 """Basic usage example for TM2020 GBX Parser."""
 
 import os
-import sys
 import json
-
-# Add parent directory to path
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from tm_gbx import GBXParser
 

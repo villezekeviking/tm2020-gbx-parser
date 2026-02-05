@@ -83,7 +83,7 @@ class GBXReader:
                 
             return string
             
-    def read_vec3(self) -> tuple:
+    def read_vec3(self) -> tuple[float, float, float]:
         """Read 3D vector (3 floats)."""
         x = self.read_float()
         y = self.read_float()

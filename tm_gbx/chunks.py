@@ -16,7 +16,7 @@ class ChunkParser:
         
         try:
             # Skip version
-            version = reader.read_uint32()
+            _ = reader.read_uint32()
             
             # Read map info
             map_uid = reader.read_string()
@@ -47,7 +47,7 @@ class ChunkParser:
         
         try:
             # Skip version
-            version = reader.read_uint32()
+            _ = reader.read_uint32()
             
             # Read author login
             author_login = reader.read_string()
@@ -71,7 +71,7 @@ class ChunkParser:
         
         try:
             # Skip version
-            version = reader.read_uint32()
+            _ = reader.read_uint32()
             
             # Read title ID
             title_id = reader.read_string()

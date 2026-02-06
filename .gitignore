@@ -74,10 +74,22 @@ target/
 
 # Jupyter Notebook
 .ipynb_checkpoints
+.ipynb_checkpoints/
 
 # IPython
 profile_default/
 ipython_config.py
+
+# Fabric/Spark
+*.crc
+_SUCCESS
+metastore_db/
+spark-warehouse/
+
+# Data files
+*.json
+*.Gbx
+*.gbx
 
 # pyenv
 .python-version

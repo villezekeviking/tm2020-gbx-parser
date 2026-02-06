@@ -1,1 +1,8 @@
-python-lzo>=1.14
+# Legacy GBX parser dependency (kept for reference)
+# python-lzo>=1.14
+
+# Microsoft Fabric / PySpark dependencies
+pyspark>=3.3.0
+delta-spark>=2.3.0
+pandas>=2.0.0
+pyarrow>=12.0.0

@@ -2,16 +2,17 @@ from setuptools import setup, find_packages
 
 setup(
     name="tm2020-gbx-parser",
-    version="0.1.0",
+    version="0.2.0",
     packages=find_packages(),
     install_requires=[
-        "python-lzo>=1.14",
+        # No required dependencies - pure Python stdlib
     ],
     extras_require={
-        'dev': ['pytest'],
+        'lzo': ['python-lzo>=1.14'],  # Optional for body decompression
+        'dev': ['pytest>=7.0'],
     },
     python_requires='>=3.7',
     author="villezekeviking",
-    description="Python parser for TrackMania 2020 GBX replay files",
+    description="Pure-Python parser for TrackMania 2020 GBX replay files",
     url="https://github.com/villezekeviking/tm2020-gbx-parser",
 )

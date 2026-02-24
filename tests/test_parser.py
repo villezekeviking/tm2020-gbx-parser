@@ -2,91 +2,117 @@
 
 import os
 import pytest
-
-from tm_gbx import GBXParser
+from tm_gbx import parse_gbx
 
 
 class TestGBXParser:
     """Test GBX parser functionality."""
     
     @pytest.fixture
-    def test_file_path(self):
-        """Get path to test replay file."""
-        # Look for test file in tests directory
-        test_file = os.path.join(os.path.dirname(__file__), "Ville (Best).Gbx")
-        if not os.path.exists(test_file):
-            pytest.skip(f"Test file not found: {test_file}")
-        return test_file
-        
-    def test_parser_initialization(self, test_file_path):
-        """Test parser can be initialized with a file."""
-        parser = GBXParser(test_file_path)
-        assert parser.file_path == test_file_path
-        
-    def test_parser_with_nonexistent_file(self):
-        """Test parser raises error for nonexistent file."""
-        with pytest.raises(FileNotFoundError):
-            GBXParser("nonexistent.Gbx")
-            
-    def test_parse_metadata(self, test_file_path):
-        """Test parsing extracts metadata correctly."""
-        parser = GBXParser(test_file_path)
-        data = parser.parse()
-        
-        # Check structure
-        assert 'metadata' in data
-        assert 'ghost_samples' in data
-        
-        metadata = data['metadata']
-        
-        # Check expected values from problem statement
-        assert metadata['race_time_ms'] == 26335, f"Expected race_time_ms=26335, got {metadata['race_time_ms']}"
-        assert metadata['map_name'] == "Fall 2023 - 03", f"Expected map_name='Fall 2023 - 03', got {metadata['map_name']}"
-        assert metadata['player_login'] == "xtVxJniqQciL7b9biL1pzg", f"Expected player_login='xtVxJniqQciL7b9biL1pzg', got {metadata['player_login']}"
-        assert metadata['player_nickname'] == "VilleZekeViking", f"Expected player_nickname='VilleZekeViking', got {metadata['player_nickname']}"
-        assert len(metadata['checkpoints']) == 7, f"Expected 7 checkpoints, got {len(metadata['checkpoints'])}"
-        
-    def test_parse_returns_correct_structure(self, test_file_path):
-        """Test parse returns expected data structure."""
-        parser = GBXParser(test_file_path)
-        data = parser.parse()
-        
-        # Check top-level keys
-        assert 'metadata' in data
-        assert 'ghost_samples' in data
-        
-        metadata = data['metadata']
-        
-        # Check metadata keys exist (even if None)
-        expected_keys = [
-            'player_login', 'player_nickname', 'map_name', 
-            'map_uid', 'map_author', 'race_time_ms', 
-            'checkpoints', 'num_respawns', 'game_version', 'title_id'
+    def test_files_dir(self):
+        """Get path to test files directory."""
+        return os.path.dirname(__file__)
+    
+    @pytest.fixture
+    def all_test_files(self, test_files_dir):
+        """Get all test .Gbx files."""
+        files = [
+            "Johan (Best).Gbx",
+            "Johan (First).Gbx",
+            "Jon (Best).Gbx",
+            "Jon (First).Gbx",
+            "Oskar (Best).gbx",
+            "Oskar (First).gbx",
+            "Ville (Best).Gbx",
+            "Ville (First).Gbx"
         ]
-        
-        for key in expected_keys:
-            assert key in metadata, f"Missing metadata key: {key}"
+        return [os.path.join(test_files_dir, f) for f in files]
+    
+    def test_parser_doesnt_crash_on_all_files(self, all_test_files):
+        """Test parser doesn't crash on any of the 8 test files."""
+        for filepath in all_test_files:
+            if not os.path.exists(filepath):
+                pytest.skip(f"Test file not found: {filepath}")
             
-    def test_ghost_samples_structure(self, test_file_path):
-        """Test ghost samples have correct structure (even if empty)."""
-        parser = GBXParser(test_file_path)
-        data = parser.parse()
+            # Should not raise exception
+            result = parse_gbx(filepath)
+            
+            # Check basic structure
+            assert 'metadata' in result
+            assert 'ghost_samples' in result
+            assert isinstance(result['metadata'], dict)
+            assert isinstance(result['ghost_samples'], list)
+    
+    def test_parse_ville_best_metadata(self, test_files_dir):
+        """Test parsing extracts correct metadata from Ville (Best).Gbx."""
+        filepath = os.path.join(test_files_dir, "Ville (Best).Gbx")
+        if not os.path.exists(filepath):
+            pytest.skip(f"Test file not found: {filepath}")
         
-        ghost_samples = data['ghost_samples']
+        result = parse_gbx(filepath)
+        metadata = result['metadata']
+        
+        # Verify specific values from the file
+        assert metadata['player_nickname'] == 'VilleZekeViking'
+        assert metadata['player_login'] == 'xtVxJniqQciL7b9biL1pzg'
+        assert metadata['race_time_ms'] == 26335
+        assert metadata['map_uid'] == 'L4ZaQ8GwLjMRAnm5xafWb2pvS_j'
+        assert metadata['map_name'] == 'Fall 2023 - 03'
+        assert metadata['map_author'] == 'Nadeo'
+        assert metadata['title_id'] == 'TMStadium'
+        assert metadata['num_checkpoints'] == 7
+    
+    def test_header_parsing_extracts_player_info(self, all_test_files):
+        """Test header parsing extracts player info from all files."""
+        for filepath in all_test_files:
+            if not os.path.exists(filepath):
+                continue
+            
+            result = parse_gbx(filepath)
+            metadata = result['metadata']
+            
+            # All files should have at least player nickname
+            assert 'player_nickname' in metadata
+            assert metadata['player_nickname'] is not None
+            assert len(metadata['player_nickname']) > 0
+    
+    def test_header_parsing_extracts_race_time(self, all_test_files):
+        """Test header parsing extracts race time from all files."""
+        for filepath in all_test_files:
+            if not os.path.exists(filepath):
+                continue
+            
+            result = parse_gbx(filepath)
+            metadata = result['metadata']
+            
+            # All files should have race time
+            assert 'race_time_ms' in metadata
+            assert metadata['race_time_ms'] is not None
+            assert metadata['race_time_ms'] > 0
+    
+    def test_ghost_samples_structure(self, test_files_dir):
+        """Test ghost samples have correct structure when present."""
+        filepath = os.path.join(test_files_dir, "Ville (Best).Gbx")
+        if not os.path.exists(filepath):
+            pytest.skip(f"Test file not found: {filepath}")
+        
+        result = parse_gbx(filepath)
+        ghost_samples = result['ghost_samples']
+        
+        # Ghost samples should be a list (may be empty if LZO not available)
         assert isinstance(ghost_samples, list)
         
         # If we have samples, check structure
-        if ghost_samples:
+        if len(ghost_samples) > 0:
             sample = ghost_samples[0]
             assert 'time_ms' in sample
             assert 'position' in sample
-            assert 'velocity' in sample
-            assert 'speed' in sample
             
-            # Check position/velocity structure
-            for key in ['x', 'y', 'z']:
-                assert key in sample['position']
-                assert key in sample['velocity']
+            # Check position structure
+            position = sample['position']
+            assert 'x' in position
+            assert 'y' in position
+            assert 'z' in position
 
 
 if __name__ == '__main__':

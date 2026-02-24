@@ -1,91 +1,88 @@
-"""Binary reader utilities for GBX files."""
+"""Binary reader utilities for GBX files with little-endian support."""
 
 import struct
-from typing import BinaryIO, Optional
 
 
-class GBXReader:
-    """Binary reader for GBX files with little-endian support."""
-    
-    def __init__(self, file_obj: BinaryIO):
-        """Initialize reader with binary file object."""
-        self.file = file_obj
-        self.lookback_strings = []  # For GBX string optimization
-        
-    def tell(self) -> int:
-        """Get current position in file."""
-        return self.file.tell()
-        
-    def seek(self, position: int):
-        """Seek to position in file."""
-        self.file.seek(position)
-        
-    def read_bytes(self, count: int) -> bytes:
-        """Read raw bytes."""
-        data = self.file.read(count)
-        if len(data) != count:
-            raise EOFError(f"Expected {count} bytes, got {len(data)}")
-        return data
-        
-    def read_uint8(self) -> int:
-        """Read unsigned 8-bit integer."""
-        return struct.unpack('<B', self.read_bytes(1))[0]
-        
-    def read_uint16(self) -> int:
-        """Read unsigned 16-bit integer (little-endian)."""
-        return struct.unpack('<H', self.read_bytes(2))[0]
-        
-    def read_uint32(self) -> int:
-        """Read unsigned 32-bit integer (little-endian)."""
-        return struct.unpack('<I', self.read_bytes(4))[0]
-        
-    def read_int32(self) -> int:
-        """Read signed 32-bit integer (little-endian)."""
-        return struct.unpack('<i', self.read_bytes(4))[0]
-        
-    def read_float(self) -> float:
-        """Read 32-bit float (little-endian)."""
-        return struct.unpack('<f', self.read_bytes(4))[0]
-        
-    def read_string(self) -> str:
-        """Read length-prefixed string with GBX lookback support."""
-        length = self.read_uint32()
-        
-        # Handle lookback strings (GBX optimization)
-        if length == 0:
-            return ""
-        elif length == 0x80000000 or length >= 0xC0000000:
-            # Lookback string reference
-            if length == 0x80000000:
-                # Empty lookback
-                return ""
-            else:
-                # Reference to previous string
-                index = length & 0x3FFF
-                if index == 0 or index > len(self.lookback_strings):
-                    return ""
-                return self.lookback_strings[index - 1]
-        else:
-            # Normal string
-            if length > 0x10000:  # Sanity check
-                return ""
-            string_bytes = self.read_bytes(length)
-            try:
-                string = string_bytes.decode('utf-8')
-            except UnicodeDecodeError:
-                # Try latin-1 as fallback
-                string = string_bytes.decode('latin-1', errors='ignore')
-            
-            # Add to lookback strings
-            self.lookback_strings.append(string)
-            if len(self.lookback_strings) > 0x1000:  # Limit lookback size
-                self.lookback_strings.pop(0)
-                
-            return string
-            
-    def read_vec3(self) -> tuple[float, float, float]:
-        """Read 3D vector (3 floats)."""
-        x = self.read_float()
-        y = self.read_float()
-        z = self.read_float()
-        return (x, y, z)
+def read_uint8(f):
+    """Read unsigned 8-bit integer."""
+    data = f.read(1)
+    if len(data) != 1:
+        raise EOFError("Failed to read uint8")
+    return struct.unpack('<B', data)[0]
+
+
+def read_uint16(f):
+    """Read unsigned 16-bit integer (little-endian)."""
+    data = f.read(2)
+    if len(data) != 2:
+        raise EOFError("Failed to read uint16")
+    return struct.unpack('<H', data)[0]
+
+
+def read_int16(f):
+    """Read signed 16-bit integer (little-endian)."""
+    data = f.read(2)
+    if len(data) != 2:
+        raise EOFError("Failed to read int16")
+    return struct.unpack('<h', data)[0]
+
+
+def read_int32(f):
+    """Read signed 32-bit integer (little-endian)."""
+    data = f.read(4)
+    if len(data) != 4:
+        raise EOFError("Failed to read int32")
+    return struct.unpack('<i', data)[0]
+
+
+def read_uint32(f):
+    """Read unsigned 32-bit integer (little-endian)."""
+    data = f.read(4)
+    if len(data) != 4:
+        raise EOFError("Failed to read uint32")
+    return struct.unpack('<I', data)[0]
+
+
+def read_float(f):
+    """Read 32-bit float (little-endian)."""
+    data = f.read(4)
+    if len(data) != 4:
+        raise EOFError("Failed to read float")
+    return struct.unpack('<f', data)[0]
+
+
+def read_vec3(f):
+    """Read 3D vector (3 floats)."""
+    x = read_float(f)
+    y = read_float(f)
+    z = read_float(f)
+    return (x, y, z)
+
+
+def read_string(f):
+    """Read length-prefixed string (basic version, no lookback)."""
+    length = read_uint32(f)
+    if length == 0:
+        return ""
+    if length > 100000:  # Sanity check
+        return ""
+    data = f.read(length)
+    if len(data) != length:
+        raise EOFError(f"Failed to read string of length {length}")
+    try:
+        return data.decode('utf-8')
+    except UnicodeDecodeError:
+        return data.decode('latin-1', errors='ignore')
+
+
+def read_data(f):
+    """Read length-prefixed byte array (MwBuffer/Data)."""
+    length = read_uint32(f)
+    if length == 0:
+        return b''
+    if length > 100000000:  # Sanity check: 100MB
+        raise ValueError(f"Unreasonable data length: {length}")
+    data = f.read(length)
+    if len(data) != length:
+        raise EOFError(f"Failed to read data of length {length}")
+    return data

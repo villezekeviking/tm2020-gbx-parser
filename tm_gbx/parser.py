@@ -1,204 +1,95 @@
-"""Main GBX parser implementation."""
+"""Main GBX parser entry point.
 
-import os
-import logging
-from typing import Dict, List, Any, Optional
-from .reader import GBXReader
-from .models import Metadata, GhostSample, Vec3
-from .chunks import ChunkParser
+Pure-Python parser for TrackMania 2020 replay files (.Gbx).
+"""
 
-logger = logging.getLogger(__name__)
-
-# Try to import pygbx for metadata extraction
-try:
-    from pygbx import Gbx, GbxType
-    PYGBX_AVAILABLE = True
-except ImportError:
-    PYGBX_AVAILABLE = False
+from .header import parse_header
+from .ghost import find_ghost_samples_in_body, find_zlib_ghost_data
+from .reader import read_int32, read_uint32, read_string
 
 
-class GBXParser:
-    """Parser for TrackMania 2020 GBX replay files."""
+def parse_gbx(filepath):
+    """Parse a GBX replay file.
     
-    def __init__(self, file_path: str):
-        """Initialize parser with GBX file path.
+    Args:
+        filepath: Path to .Gbx replay file
         
-        Args:
-            file_path: Path to the .Gbx replay file
-        """
-        if not os.path.exists(file_path):
-            raise FileNotFoundError(f"File not found: {file_path}")
+    Returns:
+        Dictionary with 'metadata', 'ghost_info', and 'ghost_samples' keys
+    """
+    with open(filepath, 'rb') as f:
+        # Parse header
+        header_data = parse_header(f)
+        metadata = header_data.get('metadata', {})
         
-        self.file_path = file_path
-        self.metadata = Metadata()
-        self.ghost_samples = []
+        # Skip ref table
+        num_external = read_int32(f)
         
-    def parse(self) -> Dict[str, Any]:
-        """Parse GBX file and return data dictionary.
+        if num_external > 0:
+            # Read external refs (most TM2020 replays have 0)
+            for _ in range(num_external):
+                # Skip external node info
+                # flags (int32), file path (string), or node_index (int32)
+                flags = read_int32(f)
+                if (flags & 0x4) != 0:
+                    # Has file path
+                    file_path = read_string(f)
+                else:
+                    # Has node index instead of file path
+                    file_node_index = read_int32(f)
+                # Use resource index if needed
+                if (flags & 0x8) != 0:
+                    resource_index = read_int32(f)
+                # Node index
+                node_index = read_int32(f)
+                # Use flags
+                use_flags = read_int32(f)
+                # Folder deps
+                if (flags & 0x10) != 0:
+                    folder_dep_count = read_int32(f)
         
-        Returns:
-            Dictionary with 'metadata' and 'ghost_samples' keys
-        """
-        # Phase 1: Use pygbx for reliable metadata extraction
-        if PYGBX_AVAILABLE:
-            self._parse_with_pygbx()
-        else:
-            # Fallback to custom parsing
-            self._parse_custom()
+        # Read body
+        body_data = None
+        ghost_info = None
+        ghost_samples = []
+        
+        body_compressed = header_data.get('body_compressed', 0)
+        
+        if body_compressed == 0x43:  # 'C' = LZO compressed
+            # Read uncompressed_size and compressed_size
+            uncompressed_size = read_uint32(f)
+            compressed_size = read_uint32(f)
             
-        # Phase 2: Try to extract ghost samples (future enhancement)
-        # For now, we focus on metadata which pygbx handles well
-        
-        return {
-            "metadata": self.metadata.to_dict(),
-            "ghost_samples": [sample.to_dict() for sample in self.ghost_samples]
-        }
-        
-    def _parse_with_pygbx(self):
-        """Parse using pygbx library for metadata."""
-        try:
-            g = Gbx(self.file_path)
+            # Read compressed data
+            compressed_data = f.read(compressed_size)
             
-            # Get ghost class
-            ghost = g.get_class_by_id(GbxType.CTN_GHOST)
-            
-            if ghost:
-                # Extract metadata from ghost
-                if hasattr(ghost, 'race_time'):
-                    self.metadata.race_time_ms = ghost.race_time
-                
-                if hasattr(ghost, 'cp_times'):
-                    self.metadata.checkpoints = ghost.cp_times
-                    
-                if hasattr(ghost, 'login'):
-                    self.metadata.player_login = ghost.login
-                    
-                if hasattr(ghost, 'nickname'):
-                    self.metadata.player_nickname = ghost.nickname
-                    
-                if hasattr(ghost, 'nb_respawns'):
-                    self.metadata.num_respawns = ghost.nb_respawns
-                    
-            # Get challenge (map) class
-            challenge = g.get_class_by_id(GbxType.CHALLENGE)
-            
-            if challenge:
-                if hasattr(challenge, 'map_uid'):
-                    self.metadata.map_uid = challenge.map_uid
-                    
-                if hasattr(challenge, 'map_name'):
-                    self.metadata.map_name = challenge.map_name
-                    
-                if hasattr(challenge, 'author_login'):
-                    self.metadata.map_author = challenge.author_login
-                    
-            # Try to get version info
-            if hasattr(g, 'version'):
-                self.metadata.game_version = str(g.version)
-                
-        except Exception as e:
-            # If pygbx fails, fall back to custom parsing
-            logger.warning(f"pygbx parsing failed: {e}, falling back to custom parsing")
-            self._parse_custom()
-            
-    def _parse_custom(self):
-        """Custom GBX parsing (fallback when pygbx not available)."""
-        with open(self.file_path, 'rb') as f:
-            reader = GBXReader(f)
-            
-            # Parse header
-            header_data = self._parse_header(reader)
-            
-            # Parse metadata from chunks
-            metadata_dict = self._parse_metadata(reader)
-            
-            # Update metadata from parsed data
-            for key, value in metadata_dict.items():
-                if hasattr(self.metadata, key) and value is not None:
-                    setattr(self.metadata, key, value)
-                    
-    def _parse_header(self, reader: GBXReader) -> Dict[str, Any]:
-        """Parse GBX header.
+            # Try to decompress with LZO
+            try:
+                import lzo
+                body_data = lzo.decompress(compressed_data, False, uncompressed_size)
+            except ImportError:
+                # LZO not available - set body_data to None
+                body_data = None
+            except Exception as e:
+                # Decompression failed
+                body_data = None
         
-        Returns:
-            Dictionary with header information
-        """
-        # Read magic bytes
-        magic = reader.read_bytes(3)
-        if magic != b'GBX':
-            raise ValueError(f"Invalid GBX file: magic bytes are {magic}")
-            
-        # Read version
-        version = reader.read_uint16()
-        
-        # Read format byte
-        format_byte = reader.read_uint8()
-        
-        # Read compression info
-        ref_table_compressed = reader.read_uint8()
-        body_compressed = reader.read_uint8()
-        
-        # Read unknown byte
-        unknown = reader.read_uint8()
-        
-        # Read class ID
-        class_id = reader.read_uint32()
-        
-        return {
-            'version': version,
-            'format': chr(format_byte) if 32 <= format_byte < 127 else format_byte,
-            'class_id': class_id,
-            'ref_table_compressed': chr(ref_table_compressed) if 32 <= ref_table_compressed < 127 else ref_table_compressed,
-            'body_compressed': chr(body_compressed) if 32 <= body_compressed < 127 else body_compressed
-        }
-        
-    def _parse_metadata(self, reader: GBXReader) -> Dict[str, Any]:
-        """Extract metadata from header chunks.
-        
-        Returns:
-            Dictionary with metadata fields
-        """
-        metadata = {}
-        
-        try:
-            # Read user data size
-            user_data_size = reader.read_uint32()
-            
-            if user_data_size > 0:
-                # Read number of header chunks
-                num_chunks = reader.read_uint32()
-                
-                # Read each chunk
-                for _ in range(num_chunks):
-                    chunk_id = reader.read_uint32()
-                    chunk_size = reader.read_uint32()
-                    
-                    # Parse known chunks
-                    if chunk_id == 0x03093000:
-                        chunk_data = ChunkParser.parse_chunk_0x03093000(reader, chunk_size)
-                        metadata.update(chunk_data)
-                    elif chunk_id == 0x03093002:
-                        chunk_data = ChunkParser.parse_chunk_0x03093002(reader, chunk_size)
-                        metadata.update(chunk_data)
-                    elif chunk_id == 0x03093018:
-                        chunk_data = ChunkParser.parse_chunk_0x03093018(reader, chunk_size)
-                        metadata.update(chunk_data)
-                    else:
-                        # Skip unknown chunks
-                        reader.read_bytes(chunk_size)
-                        
-        except Exception as e:
-            logger.warning(f"Error parsing metadata chunks: {e}")
-            
-        return metadata
-        
-    def _parse_ghost_data(self):
-        """Extract ghost samples (future enhancement).
-        
-        This is a placeholder for future implementation of full
-        telemetry data extraction.
-        """
-        # TODO: Implement ghost sample extraction
-        # This requires deeper understanding of TM2020 binary format
-        # and handling of compressed data
-        pass
+        # If body decompressed, try to find ghost samples
+        if body_data:
+            # Try direct search for ghost samples
+            result = find_ghost_samples_in_body(body_data)
+            if result:
+                ghost_info = result.get('ghost_info')
+                ghost_samples = result.get('ghost_samples', [])
+            else:
+                # Try searching for zlib-compressed ghost data
+                result = find_zlib_ghost_data(body_data)
+                if result:
+                    ghost_info = result.get('ghost_info')
+                    ghost_samples = result.get('ghost_samples', [])
+    
+    return {
+        'metadata': metadata,
+        'ghost_info': ghost_info,
+        'ghost_samples': ghost_samples
+    }

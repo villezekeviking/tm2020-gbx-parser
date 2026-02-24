@@ -3,7 +3,7 @@
 import os
 import json
 
-from tm_gbx import GBXParser
+from tm_gbx import parse_gbx
 
 
 def main():
@@ -18,27 +18,27 @@ def main():
         
     # Parse replay file
     print(f"Parsing: {test_file}\n")
-    parser = GBXParser(test_file)
-    data = parser.parse()
+    data = parse_gbx(test_file)
     
     # Print metadata
+    metadata = data['metadata']
     print("Replay Metadata:")
-    print(f"  Player: {data['metadata']['player_nickname']} ({data['metadata']['player_login']})")
-    print(f"  Map: {data['metadata']['map_name']}")
-    print(f"  Time: {data['metadata']['race_time_ms']}ms")
-    print(f"  Checkpoints: {len(data['metadata']['checkpoints'])}")
-    
-    if data['metadata']['checkpoints']:
-        print(f"  Checkpoint times: {data['metadata']['checkpoints']}")
+    print(f"  Player: {metadata.get('player_nickname', '?')} ({metadata.get('player_login', '?')})")
+    print(f"  Map: {metadata.get('map_name', '?')}")
+    print(f"  Map UID: {metadata.get('map_uid', '?')}")
+    print(f"  Time: {metadata.get('race_time_ms', 0)}ms")
+    print(f"  Title: {metadata.get('title_id', '?')}")
     
     # Check for ghost samples
     if data['ghost_samples']:
         print(f"\nGhost samples: {len(data['ghost_samples'])}")
         print("First few samples:")
-        for sample in data['ghost_samples'][:5]:
-            print(f"  Time {sample['time_ms']}ms: Position {sample['position']}, Speed {sample['speed']}")
+        for i, sample in enumerate(data['ghost_samples'][:5]):
+            pos = sample['position']
+            print(f"  {i}: Time {sample['time_ms']}ms - "
+                  f"Position ({pos['x']:.2f}, {pos['y']:.2f}, {pos['z']:.2f})")
     else:
-        print("\nNo ghost samples available (telemetry extraction not yet implemented)")
+        print("\nNo ghost samples (requires python-lzo for body decompression)")
     
     # Save to JSON
     output_file = 'output.json'

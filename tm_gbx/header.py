@@ -125,10 +125,9 @@ def parse_header(f):
                     metadata['xml_data'] = xml_string
                     
                     # Try to extract map_name from XML
-                    if 'map name="' in xml_string:
-                        match = re.search(r'map name="([^"]+)"', xml_string)
-                        if match:
-                            metadata['map_name'] = match.group(1)
+                    match = re.search(r'<map[^>]+name="([^"]+)"', xml_string)
+                    if match:
+                        metadata['map_name'] = match.group(1)
                     
                     # Try to extract race time from XML if not already set
                     if 'race_time_ms' not in metadata and 'times best="' in xml_string:

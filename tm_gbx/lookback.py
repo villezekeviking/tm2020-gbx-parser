@@ -56,10 +56,11 @@ class LookbackReader:
         # Otherwise read a new string
         string = read_string(f)
         
-        # Store it with key = index + counter + 1
-        key = index + self.counter + 1
-        self.lookback_strings[key] = string
+        # Store it with key based on counter
+        # When masked_index is 0, we store with counter+1 as key
         self.counter += 1
+        key = self.counter
+        self.lookback_strings[key] = string
         
         return string
     

@@ -35,8 +35,8 @@ def parse_gbx(filepath):
                     # Has file path
                     file_path = read_string(f)
                 else:
-                    # Has node index
-                    node_index = read_int32(f)
+                    # Has node index instead of file path
+                    file_node_index = read_int32(f)
                 # Use resource index if needed
                 if (flags & 0x8) != 0:
                     resource_index = read_int32(f)

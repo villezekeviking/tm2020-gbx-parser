@@ -116,7 +116,7 @@ def find_ghost_samples_in_body(body_data):
                         'time_ms': times[i] if i < len(times) else i * sample_period,
                         'position': {'x': x, 'y': y, 'z': z}
                     })
-                except:
+                except (struct.error, IOError, IndexError):
                     # Skip malformed sample
                     pass
         
@@ -132,7 +132,7 @@ def find_ghost_samples_in_body(body_data):
             'ghost_samples': samples
         }
     
-    except Exception as e:
+    except (struct.error, IOError, ValueError, EOFError) as e:
         # Failed to parse
         return None
 
@@ -183,7 +183,7 @@ def find_zlib_ghost_data(body_data):
                         result = find_ghost_samples_in_body(decompressed)
                         if result:
                             return result
-                except:
+                except (zlib.error, struct.error, ValueError):
                     pass
             
             offset += 1

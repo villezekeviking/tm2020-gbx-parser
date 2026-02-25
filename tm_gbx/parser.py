@@ -3,8 +3,9 @@
 Pure-Python parser for TrackMania 2020 replay files (.Gbx).
 """
 
+import zlib
 from .header import parse_header
-from .ghost import find_ghost_samples_in_body, find_zlib_ghost_data
+from .ghost import parse_ghost_from_body
 from .reader import read_int32, read_uint32, read_string
 
 
@@ -48,14 +49,14 @@ def parse_gbx(filepath):
                 if (flags & 0x10) != 0:
                     folder_dep_count = read_int32(f)
         
-        # Read body
+        # Read body - handle both zlib (.Ghost.Gbx) and LZO (replay .Gbx) compression
         body_data = None
         ghost_info = None
         ghost_samples = []
         
         body_compressed = header_data.get('body_compressed', 0)
         
-        if body_compressed == 0x43:  # 'C' = LZO compressed
+        if body_compressed == 0x43:  # 'C' = compressed
             # Read uncompressed_size and compressed_size
             uncompressed_size = read_uint32(f)
             compressed_size = read_uint32(f)
@@ -63,30 +64,26 @@ def parse_gbx(filepath):
             # Read compressed data
             compressed_data = f.read(compressed_size)
             
-            # Try to decompress with LZO
+            # Try zlib first (for .Ghost.Gbx files)
             try:
-                import lzo
-                body_data = lzo.decompress(compressed_data, False, uncompressed_size)
-            except ImportError:
-                # LZO not available - set body_data to None
-                body_data = None
-            except Exception as e:
-                # Decompression failed
-                body_data = None
+                body_data = zlib.decompress(compressed_data)
+            except zlib.error:
+                # Fall back to LZO (for replay .Gbx files) if available
+                try:
+                    import lzo
+                    body_data = lzo.decompress(compressed_data, False, uncompressed_size)
+                except ImportError:
+                    # LZO not available - can't decompress replay body
+                    body_data = None
+                except Exception:
+                    body_data = None
         
-        # If body decompressed, try to find ghost samples
+        # If body decompressed, parse ghost telemetry
         if body_data:
-            # Try direct search for ghost samples
-            result = find_ghost_samples_in_body(body_data)
+            result = parse_ghost_from_body(body_data)
             if result:
                 ghost_info = result.get('ghost_info')
                 ghost_samples = result.get('ghost_samples', [])
-            else:
-                # Try searching for zlib-compressed ghost data
-                result = find_zlib_ghost_data(body_data)
-                if result:
-                    ghost_info = result.get('ghost_info')
-                    ghost_samples = result.get('ghost_samples', [])
     
     return {
         'metadata': metadata,

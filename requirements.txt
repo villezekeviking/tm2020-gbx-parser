@@ -1,7 +1,9 @@
-# Legacy GBX parser dependency (kept for reference)
-# python-lzo>=1.14
+# Core dependencies: None (uses Python stdlib: struct, zlib, io, math, hashlib, os, datetime)
 
-# Microsoft Fabric / PySpark dependencies
+# Optional: python-lzo>=1.14 (for replay .Gbx files with LZO-compressed body)
+# Note: .Ghost.Gbx files use zlib compression (no LZO needed)
+
+# Microsoft Fabric / PySpark dependencies (for Lakehouse notebooks)
 pyspark>=3.3.0
 delta-spark>=2.3.0
 pandas>=2.0.0

@@ -500,8 +500,8 @@ if len(parsed_ghosts) > 0:
     
     df_header = spark.createDataFrame(header_rows)
     
-    # Write to Delta table (append mode)
-    df_header.write.format("delta").mode("append").save("/lakehouse/default/Tables/ghost_header")
+    # Overwrite mode — safe to rerun without duplicates
+    df_header.write.format("delta").mode("overwrite").save("/lakehouse/default/Tables/ghost_header")
     
     print(f"✓ Wrote {len(header_rows)} rows to ghost_header table")
     
@@ -580,14 +580,18 @@ if len(parsed_ghosts) > 0:
     
     print(f"Prepared {len(telemetry_rows)} telemetry rows")
     
-    # Create DataFrame in batches to avoid memory issues
+    # Create DataFrame in batches to avoid memory issues.
+    # First batch uses overwrite (clears the table), subsequent batches use append.
+    # This ensures we never accumulate duplicate rows across reruns while still
+    # handling large datasets that don't fit in a single DataFrame.
     batch_size = 100000
     for i in range(0, len(telemetry_rows), batch_size):
         batch = telemetry_rows[i:i+batch_size]
         df_telemetry = spark.createDataFrame(batch)
         
-        # Write to Delta table (append mode)
-        df_telemetry.write.format("delta").mode("append").save("/lakehouse/default/Tables/ghost_telemetry")
+        # Overwrite on first batch (clears old data); append for the rest
+        write_mode = "overwrite" if i == 0 else "append"
+        df_telemetry.write.format("delta").mode(write_mode).save("/lakehouse/default/Tables/ghost_telemetry")
         
         print(f"✓ Wrote batch {i//batch_size + 1}: {len(batch)} rows")
     

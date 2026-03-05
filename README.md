@@ -195,15 +195,71 @@ Tests validate parsing on 8 real replay files in the `tests/` directory.
 
 ## Lakehouse Pipeline
 
-This parser is part of a Microsoft Fabric Lakehouse pipeline for TrackMania 2020 ghost analytics:
+This parser is part of a Microsoft Fabric Lakehouse pipeline for TrackMania 2020 ghost analytics using the **Medallion Architecture**:
 
 - **Bronze Layer** (`tm2020_bronze`): Raw GBX file ingestion
 - **Silver Layer** (`tm2020_silver`): Cleaned and normalized telemetry tables
-- **Gold Layer** (`tm2020_gold`): Analytics-ready aggregated tables
+- **Gold Layer** (`tm2020_gold`): Analytics-ready tables with track spine enrichment
 
-See `notebooks/fabric_ghost_ingest.py` for the complete ingestion notebook that creates:
+See `notebooks/fabric_ghost_ingest.py` for the Silver ingestion notebook that creates:
 - `ghost_header` table: Metadata (one row per ghost)
 - `ghost_telemetry` table: Telemetry samples (52 fields, millions of rows)
+
+### Notebooks
+
+| Step | Notebook | Layer | What it does |
+|------|----------|-------|--------------|
+| 1 | `notebooks/fabric_replay_download.py` | Bronze | Download replay GBX files from Nadeo API |
+| 2 | `notebooks/fabric_ghost_ingest.py` | Silver | Parse GBX files → `silver_replay_header` + `silver_replay_telemetry` |
+| 3 | `notebooks/gold/05_build_gold_layer.py` | Gold | Build track spine + map all telemetry + enrich with calculated columns |
+
+---
+
+## Gold Layer / Track Analysis
+
+The Gold layer transforms Silver telemetry into an analytics-ready star schema for Power BI.
+
+### Track Spine Concept
+
+For each map, the **fastest player run** is used as the reference racing line — the "track spine". Each point on that run gets a sequential surrogate key (`track_point_id`) and is tagged with a `checkpoint_section` derived from the replay's checkpoint crossing times. This creates a **spatial dimension**: _where_ on the track something happened, not _when_.
+
+### Why Space Over Time
+
+In racing, **time is a measure** (a fact), not a dimension:
+- Two players can be at 13.000 seconds into a race but at completely different track positions.
+- By mapping all telemetry rows to the nearest track spine point, we compare **what happened at the same place on the track**.
+- This enables: racing-line comparison, speed profiles by track position, braking-point analysis.
+
+### Distance Calculation
+
+| Column | Formula | Notes |
+|--------|---------|-------|
+| `distance_per_sample` | `speed × 0.05` | Speed × 50 ms window (Trackmania native units, not km/h) |
+| `cumulative_distance` | running sum of `distance_per_sample` per replay | Ordered by `time_ms` |
+| `distance_to_spine` | `sqrt((x-sx)²+(y-sy)²+(z-sz)²)` | How far the car is from the racing line at that point |
+
+### Checkpoint Section Optimisation
+
+Each replay's telemetry is tagged with `checkpoint_section` based on that replay's own checkpoint crossing times. Spatial matching only compares within the same checkpoint section, which:
+- Dramatically reduces computation (avoids a full cross-map join)
+- Provides a natural Power BI slicer: compare players' performance in specific track sections
+
+### Gold Tables
+
+| Table | Description | Key Columns |
+|-------|-------------|-------------|
+| `gold_replay_header` | Replay metadata (copy from Silver) | `replay_id`, `player_nickname`, `map_uid`, `race_time_ms`, `source` |
+| `gold_track_spine` | Track dimension — one row per spatial point per map | `track_point_id` (PK within map), `map_uid`, `checkpoint_section`, `x`, `y`, `z` |
+| `gold_replay_telemetry` | All telemetry mapped to track spine | All 52 fields + `track_point_id` (FK), `checkpoint_section`, `distance_to_spine`, `distance_per_sample`, `cumulative_distance` |
+
+### Power BI Data Model
+
+Star schema — connect to Gold tables only:
+
+```
+gold_replay_header ──1:*── gold_replay_telemetry ──*:1── gold_track_spine
+    (replay_id)              (replay_id, track_point_id)     (track_point_id unique per map_uid)
+```
 
 ## Requirements
 

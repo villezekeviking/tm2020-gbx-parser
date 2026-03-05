@@ -45,6 +45,7 @@ import requests
 import base64
 import json
 import os
+import shutil
 import time as _time
 from datetime import datetime, timedelta, timezone
 
@@ -126,6 +127,19 @@ for r in records:
 # ========================================
 # Cell 4: Download Replay Files
 # ========================================
+
+# NOTE: Leaderboard downloads (top-20 per map) use a different path:
+#   leaderboard/{map_uid}/
+# Unlike player replays (idempotent by record_id filename), leaderboard
+# rankings change over time, so we delete and re-download each run:
+#
+#   leaderboard_path = f"{OUTPUT_BASE}/leaderboard/{map_uid}"
+#   if os.path.exists(leaderboard_path):
+#       shutil.rmtree(leaderboard_path)
+#       print(f"🧹 Cleaned: {leaderboard_path}")
+#
+# The block below handles PLAYER replays (skip-if-exists is correct here
+# because filenames include record_id — no duplicates on rerun).
 
 downloaded = []
 skipped    = []

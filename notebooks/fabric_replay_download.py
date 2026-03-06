@@ -1,11 +1,12 @@
 """
-Microsoft Fabric Notebook: Download Trackmania 2020 Replay GBX Files
+Microsoft Fabric Notebook: Download Trackmania 2020 Leaderboard Replay GBX Files
 
-Connects to the Trackmania Nadeo API, fetches map records for your account,
-and downloads the .Replay.Gbx files into the Lakehouse Files area.
+Connects to the Trackmania Nadeo API, fetches the top N leaderboard records
+for each map you specify, and downloads the .Replay.Gbx files into the
+Lakehouse Files area.
 
 The downloaded replays land in:
-  /lakehouse/default/Files/replays/{year}/{month}/{map_id}/
+  /lakehouse/default/Files/replays/leaderboard/{map_id}/
 
 From there, you can parse them with the existing tm_gbx parser
 and ingest into Delta tables.
@@ -17,9 +18,8 @@ Prerequisites:
 Parameters (edit in Cell 1):
 - UBI_EMAIL      : Your Ubisoft account email
 - UBI_PASSWORD   : Your Ubisoft account password
-- MODE           : "recent" (top N) or "days" (last N days)
-- TOP_N          : Number of most recent records to fetch (when MODE = "recent")
-- DAYS_AGO       : Number of days to look back (when MODE = "days")
+- MAP_IDS        : List of map IDs to fetch leaderboard replays for
+- TOP_N_PER_MAP  : How many top leaderboard entries to download per map
 """
 
 # ========================================
@@ -29,12 +29,16 @@ Parameters (edit in Cell 1):
 UBI_EMAIL    = ""   # Your Ubisoft email
 UBI_PASSWORD = ""   # Your Ubisoft password
 
-# Filter mode: "recent" = top N most recent, "days" = records from last N days
-MODE     = "recent"
-TOP_N    = 10
-DAYS_AGO = 7
+# List of map IDs to fetch leaderboard replays for.
+# You can find a map's ID in-game or via the Trackmania exchange website.
+MAP_IDS = [
+    # "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx",  # Example map ID — replace with real ones
+]
 
-# Output folder in Lakehouse
+# How many top leaderboard entries to download per map (e.g. 5 or 10)
+TOP_N_PER_MAP = 5
+
+# Output folder in Lakehouse (leaderboard replays go under leaderboard/{map_id}/)
 OUTPUT_BASE = "/lakehouse/default/Files/replays"
 
 # ========================================
@@ -47,7 +51,6 @@ import json
 import os
 import shutil
 import time as _time
-from datetime import datetime, timedelta, timezone
 
 UBI_AUTH_URL  = "https://public-ubiservices.ubi.com/v3/profiles/sessions"
 NADEO_AUTH_URL = "https://prod.trackmania.core.nadeo.online/v2/authentication/token/ubiservices"
@@ -91,92 +94,136 @@ HEADERS = {
 print(f"✓ Nadeo token obtained for account: {account_id}")
 
 # ========================================
-# Cell 3: Fetch Map Records
+# Cell 3: Fetch Leaderboard Records
 # ========================================
 
-RECORDS_URL = f"https://prod.trackmania.core.nadeo.online/v2/accounts/{account_id}/mapRecords"
+# Base URLs for the two API calls we need per map:
+#   1. Leaderboard tops   — returns the top N player positions + account IDs for a map
+#   2. Map records lookup — returns the actual records (including replay URL) for those account IDs
+LEADERBOARD_URL = "https://prod.trackmania.core.nadeo.online/v2/leaderboard/groups/Personal_Best/maps/{map_id}/tops"
+MAP_RECORDS_URL  = "https://prod.trackmania.core.nadeo.online/v2/mapRecords/"
 
-records_response = requests.get(RECORDS_URL, headers=HEADERS)
-records_response.raise_for_status()
-all_records = records_response.json()
+# We'll collect all records to download across all maps here
+all_records_to_download = []  # list of dicts: {map_id, account_id, record_id, race_time, replay_url, position}
 
-print(f"✓ Fetched {len(all_records)} total map records from API")
+for map_id in MAP_IDS:
+    print(f"\n── Map: {map_id}")
 
-# Filter records based on MODE
-if MODE == "days":
-    cutoff = datetime.now(timezone.utc) - timedelta(days=DAYS_AGO)
-    records = [
-        r for r in all_records
-        if datetime.fromisoformat(r["timestamp"].replace("+00:00", "+00:00")) >= cutoff
-    ]
-    records.sort(key=lambda r: r["timestamp"], reverse=True)
-    print(f"✓ Filtered to {len(records)} records from last {DAYS_AGO} days")
+    # --- Step A: Fetch the leaderboard top N for this map ---
+    # "onlyWorld=true" means we get the global top, not regional
+    leaderboard_response = requests.get(
+        LEADERBOARD_URL.format(map_id=map_id),
+        params={"length": TOP_N_PER_MAP, "onlyWorld": "true"},
+        headers=HEADERS
+    )
+    leaderboard_response.raise_for_status()
+    tops = leaderboard_response.json().get("tops", [])
 
-elif MODE == "recent":
-    records = sorted(all_records, key=lambda r: r["timestamp"], reverse=True)[:TOP_N]
-    print(f"✓ Selected top {len(records)} most recent records")
+    if not tops:
+        print(f"  ⚠ No leaderboard entries found for map {map_id}")
+        continue
 
-else:
-    raise ValueError(f"Unknown MODE: {MODE}. Use 'recent' or 'days'.")
+    # tops is a list of zone-grouped entries; the first entry is the world top
+    world_top = tops[0].get("top", [])
+    print(f"  ✓ Leaderboard returned {len(world_top)} entries")
 
-# Show what we got
-for r in records:
-    time_s = r["recordScore"]["time"] / 1000
-    print(f"  Map: {r['mapId'][:12]}...  Time: {time_s:.3f}s  Medal: {r['medal']}  Date: {r['timestamp'][:10]}")
+    # Collect the account IDs of the top players
+    account_ids = [entry["accountId"] for entry in world_top]
+    positions   = {entry["accountId"]: entry["position"] for entry in world_top}
+
+    # --- Step B: Fetch the actual map records for those account IDs ---
+    # This gives us the replay download URLs
+    records_response = requests.get(
+        MAP_RECORDS_URL,
+        params={
+            "mapIdList":     map_id,
+            "accountIdList": ",".join(account_ids),
+            "seasonId":      "Personal_Best"
+        },
+        headers=HEADERS
+    )
+    records_response.raise_for_status()
+    map_records = records_response.json()
+
+    print(f"  ✓ Fetched {len(map_records)} records with replay URLs")
+
+    # Add each record to our download list
+    for rec in map_records:
+        acc_id = rec.get("accountId", "")
+        all_records_to_download.append({
+            "map_id":     rec.get("mapId", map_id),
+            "account_id": acc_id,
+            "record_id":  rec.get("mapRecordId", ""),
+            "race_time":  rec.get("recordScore", {}).get("time", 0),
+            "replay_url": rec.get("url", ""),
+            "position":   positions.get(acc_id, 0),
+        })
+
+    # Brief pause between maps to respect rate limits
+    _time.sleep(0.6)
+
+print(f"\n✓ Total records to download: {len(all_records_to_download)}")
+
+# Show a preview of what we'll download
+for rec in all_records_to_download:
+    time_s = rec["race_time"] / 1000
+    print(f"  #{rec['position']:>3}  Map: {rec['map_id'][:12]}...  Account: {rec['account_id'][:8]}...  Time: {time_s:.3f}s")
 
 # ========================================
 # Cell 4: Download Replay Files
 # ========================================
 
-# NOTE: Leaderboard downloads (top-20 per map) use a different path:
-#   leaderboard/{map_uid}/
-# Unlike player replays (idempotent by record_id filename), leaderboard
-# rankings change over time, so we delete and re-download each run:
+# Leaderboard rankings change over time (new world records get set), so we
+# clean out and re-download each map's folder on every run.  This ensures the
+# files always reflect the current top N — old entries won't linger.
 #
-#   leaderboard_path = f"{OUTPUT_BASE}/leaderboard/{map_uid}"
-#   if os.path.exists(leaderboard_path):
-#       shutil.rmtree(leaderboard_path)
-#       print(f"🧹 Cleaned: {leaderboard_path}")
-#
-# The block below handles PLAYER replays (skip-if-exists is correct here
-# because filenames include record_id — no duplicates on rerun).
+# Output path per map:  replays/leaderboard/{map_id}/
+#   File name format:   pos{position:03d}_{race_time_ms}_{record_id}.Replay.Gbx
 
 downloaded = []
 skipped    = []
 failed     = []
 
-for r in records:
-    map_id    = r["mapId"]
-    record_id = r["mapRecordId"]
-    timestamp = r["timestamp"][:10]  # YYYY-MM-DD
-    race_time = r["recordScore"]["time"]
+# Group records by map so we can clean one folder at a time
+maps_seen = set()
 
-    # Parse date for folder structure
-    dt = datetime.fromisoformat(r["timestamp"].replace("+00:00", "+00:00"))
-    year  = str(dt.year)
-    month = f"{dt.month:02d}"
+for rec in all_records_to_download:
+    map_id     = rec["map_id"]
+    record_id  = rec["record_id"]
+    race_time  = rec["race_time"]
+    position   = rec["position"]
+    replay_url = rec["replay_url"]
 
-    # Build output path: replays/{year}/{month}/{map_id}/
-    out_dir = os.path.join(OUTPUT_BASE, year, month, map_id)
+    # Build output path: replays/leaderboard/{map_id}/
+    out_dir = os.path.join(OUTPUT_BASE, "leaderboard", map_id)
+
+    # On first encounter of this map in the current run, wipe the folder so
+    # stale entries from a previous run don't accumulate.
+    if map_id not in maps_seen:
+        if os.path.exists(out_dir):
+            shutil.rmtree(out_dir)
+            print(f"🧹 Cleaned stale folder: leaderboard/{map_id}/")
+        maps_seen.add(map_id)
+
     os.makedirs(out_dir, exist_ok=True)
 
-    # File name: {record_id}_{race_time_ms}.Replay.Gbx
-    file_name = f"{record_id}_{race_time}.Replay.Gbx"
+    # File name encodes leaderboard position and race time so it's self-describing
+    file_name = f"pos{position:03d}_{race_time}_{record_id}.Replay.Gbx"
     file_path = os.path.join(out_dir, file_name)
 
-    # Skip if already downloaded
+    # Skip if already downloaded (can happen if the same record appears twice)
     if os.path.exists(file_path):
         skipped.append(file_name)
         print(f"⏭ Already exists: {file_name}")
         continue
 
-    # Download the replay
-    replay_url = r.get("url", "")
+    # Check that there is actually a replay URL to download
     if not replay_url:
         failed.append((file_name, "No replay URL in record"))
         print(f"✗ No replay URL for record {record_id}")
         continue
 
+    # Download the replay file
     try:
         replay_response = requests.get(replay_url, headers=HEADERS)
         replay_response.raise_for_status()
@@ -186,13 +233,13 @@ for r in records:
 
         size_kb = len(replay_response.content) / 1024
         downloaded.append(file_name)
-        print(f"✓ Downloaded: {file_name} ({size_kb:.1f} KB)")
+        print(f"✓ Downloaded #{position:>3}: {file_name} ({size_kb:.1f} KB)")
 
     except requests.exceptions.HTTPError as e:
         failed.append((file_name, str(e)))
-        print(f"✗ Failed: {file_name} — {e}")
+        print(f"✗ Failed #{position}: {file_name} — {e}")
 
-    # Respect rate limit (~2 req/s)
+    # Respect the Nadeo rate limit (~2 requests/second)
     _time.sleep(0.6)
 
 # ========================================
@@ -202,12 +249,13 @@ for r in records:
 print("=" * 60)
 print("DOWNLOAD SUMMARY")
 print("=" * 60)
-print(f"Mode            : {MODE} ({'top ' + str(TOP_N) if MODE == 'recent' else 'last ' + str(DAYS_AGO) + ' days'})")
-print(f"Records found   : {len(records)}")
+print(f"Maps processed  : {len(MAP_IDS)}")
+print(f"Top N per map   : {TOP_N_PER_MAP}")
+print(f"Records found   : {len(all_records_to_download)}")
 print(f"Downloaded      : {len(downloaded)}")
 print(f"Already existed : {len(skipped)}")
 print(f"Failed          : {len(failed)}")
-print(f"Output folder   : {OUTPUT_BASE}")
+print(f"Output folder   : {OUTPUT_BASE}/leaderboard/")
 print("=" * 60)
 
 if failed:
@@ -217,7 +265,9 @@ if failed:
 
 # List all downloaded files
 print("\nFiles in Lakehouse:")
-for root, dirs, files in os.walk(OUTPUT_BASE):
-    for f in files:
-        rel = os.path.relpath(os.path.join(root, f), OUTPUT_BASE)
-        print(f"  📄 {rel}")
+leaderboard_dir = os.path.join(OUTPUT_BASE, "leaderboard")
+if os.path.exists(leaderboard_dir):
+    for root, dirs, files in os.walk(leaderboard_dir):
+        for f in files:
+            rel = os.path.relpath(os.path.join(root, f), OUTPUT_BASE)
+            print(f"  📄 {rel}")

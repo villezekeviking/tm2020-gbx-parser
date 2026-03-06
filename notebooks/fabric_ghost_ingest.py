@@ -30,6 +30,7 @@ import zlib
 import io
 import math
 import os
+import re
 import hashlib
 from datetime import datetime
 
@@ -538,6 +539,31 @@ def parse_gbx_file(filepath):
         }
 
 
+# Pattern: pos{NNN}_{race_time}_{account_id}_{record_id}.Replay.Gbx
+LB_PATTERN = re.compile(r'^pos(\d+)_(\d+)_([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})_(.+)\.Replay\.Gbx$')
+
+def extract_path_metadata(filepath):
+    """Extract map_uid from folder and position/race_time/account_id from filename."""
+    parts = filepath.replace("\\", "/").split("/")
+    file_name = parts[-1]
+    meta = {}
+
+    # map_uid is the folder name under leaderboard/
+    if "leaderboard" in parts:
+        idx = parts.index("leaderboard")
+        if idx + 1 < len(parts) - 1:
+            meta['map_uid'] = parts[idx + 1]
+            meta['source'] = 'leaderboard'
+
+    m = LB_PATTERN.match(file_name)
+    if m:
+        meta['position'] = int(m.group(1))
+        meta['race_time_ms'] = int(m.group(2))
+        meta['account_id'] = m.group(3)
+
+    return meta
+
+
 # ========================================
 # Cell 2: Read and Parse .Replay.Gbx and .Ghost.Gbx Files
 # ========================================
@@ -572,7 +598,8 @@ for filepath in gbx_files:
                 'end_time': result['end_time'],
                 'num_samples': result['num_samples'],
                 'samples': result['samples'],
-                'header_metadata': result['header_metadata']
+                'header_metadata': result['header_metadata'],
+                'path_metadata': extract_path_metadata(filepath),
             })
             print(f"✓ Parsed {file_name}: {result['num_samples']} samples")
         else:
@@ -592,34 +619,39 @@ if len(parsed_ghosts) > 0:
     
     for ghost in parsed_ghosts:
         meta = ghost['header_metadata']
-        
-        # race_time_ms: use header value when available, fall back to end-start
-        raw_race_time = meta.get('race_time_ms', ghost['end_time'] - ghost['start_time'])
-        if raw_race_time < 0:
-            print(f"⚠ Negative race_time_ms ({raw_race_time}) for {ghost['file_name']} — clamping to 0")
-        race_time_ms = max(int(raw_race_time), 0)
-        
+        pmeta = ghost.get('path_metadata', {})
+
+        # Path metadata fills in blanks for leaderboard replays
+        map_uid = meta.get('map_uid') or pmeta.get('map_uid', '')
+        source = pmeta.get('source', 'player')
+        race_time_ms = meta.get('race_time_ms') or pmeta.get('race_time_ms', ghost['end_time'] - ghost['start_time'])
+        if race_time_ms < 0:
+            print(f"⚠ Negative race_time_ms ({race_time_ms}) for {ghost['file_name']} — clamping to 0")
+        race_time_ms = max(int(race_time_ms), 0)
+
         header_rows.append({
             'replay_id': str(ghost['ghost_id']),
             'file_name': str(ghost['file_name']),
-            'source': 'player',
+            'source': source,
+            'map_uid': str(map_uid),
+            'map_author': str(meta.get('map_author', '')),
             'player_nickname': str(meta.get('player_nickname', '')),
             'player_login': str(meta.get('player_login', '')),
-            'map_uid': str(meta.get('map_uid', '')),
-            'map_author': str(meta.get('map_author', '')),
+            'account_id': str(pmeta.get('account_id', '')),
+            'position': int(pmeta.get('position', 0)),
             'race_time_ms': race_time_ms,
             'race_time_s': round(race_time_ms / 1000.0, 3),
             'start_time_ms': int(ghost['start_time']),
             'end_time_ms': int(ghost['end_time']),
             'num_samples': int(ghost['num_samples']),
             'sample_period_ms': int(50),
-            'ingested_at': datetime.now()
+            'ingested_at': datetime.now(),
         })
     
     df_header = spark.createDataFrame(header_rows)
     
     # Overwrite mode — safe to rerun without duplicates
-    df_header.write.format("delta").mode("overwrite").save("/lakehouse/default/Tables/silver_replay_header")
+    df_header.write.format("delta").mode("overwrite").saveAsTable("silver_replay_header")
     
     print(f"✓ Wrote {len(header_rows)} rows to silver_replay_header table")
     
@@ -709,14 +741,14 @@ if len(parsed_ghosts) > 0:
         
         # Overwrite on first batch (clears old data); append for the rest
         write_mode = "overwrite" if i == 0 else "append"
-        df_telemetry.write.format("delta").mode(write_mode).save("/lakehouse/default/Tables/silver_replay_telemetry")
+        df_telemetry.write.format("delta").mode(write_mode).saveAsTable("silver_replay_telemetry")
         
         print(f"✓ Wrote batch {i//batch_size + 1}: {len(batch)} rows")
     
     print(f"\n✓ Total telemetry rows written: {len(telemetry_rows)}")
     
     # Show sample
-    df_sample = spark.read.format("delta").load("/lakehouse/default/Tables/silver_replay_telemetry")
+    df_sample = spark.table("silver_replay_telemetry")
     df_sample.show(10, truncate=False)
 else:
     print("No telemetry data to ingest")
@@ -736,11 +768,11 @@ print("=" * 60)
 
 # Query the tables
 print("\nReplay Header Table:")
-spark.read.format("delta").load("/lakehouse/default/Tables/silver_replay_header").show(10, truncate=False)
+spark.table("silver_replay_header").show(10, truncate=False)
 
 print("\nReplay Telemetry Table (sample):")
 spark.sql("""
     SELECT replay_id, time_s, x, y, z, speed, steer, gas, brake
-    FROM delta.`/lakehouse/default/Tables/silver_replay_telemetry`
+    FROM silver_replay_telemetry
     LIMIT 20
 """).show(20, truncate=False)

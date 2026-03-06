@@ -9,8 +9,8 @@ Prerequisites:
 - Write access to /lakehouse/default/Tables/
 
 Output:
-- ghost_header: One row per ghost file (metadata + ghost info)
-- ghost_telemetry: One row per telemetry sample (52 fields)
+- silver_replay_header:    One row per ghost file (metadata + ghost info)
+- silver_replay_telemetry: One row per telemetry sample (52 fields)
 
 Note: The 'spark' variable is pre-defined in Fabric Notebooks.
 """
@@ -84,6 +84,107 @@ def read_string(f):
         return data.decode('utf-8')
     except UnicodeDecodeError:
         return data.decode('latin-1', errors='ignore')
+
+
+class _LookbackReader:
+    """Manages GBX lookback string reading (string interning system)."""
+
+    def __init__(self):
+        self.id_version = None
+        self.lookback_strings = {}
+        self.counter = 0
+
+    def read_id(self, f):
+        if self.id_version is None:
+            self.id_version = read_uint32(f)
+            if self.id_version < 3:
+                return ""
+        index = read_uint32(f)
+        if index == 0xFFFFFFFF:
+            return ""
+        high_bits = (index >> 30) & 0x3
+        if high_bits != 1 and high_bits != 2:
+            return ""
+        masked_index = index & 0x3FFFFFFF
+        if masked_index != 0:
+            return self.lookback_strings.get(masked_index, "")
+        string = read_string(f)
+        self.counter += 1
+        self.lookback_strings[self.counter] = string
+        return string
+
+    def read_ident(self, f):
+        id_str = self.read_id(f)
+        collection = self.read_id(f)
+        author = self.read_id(f)
+        return (id_str, collection, author)
+
+
+def _parse_gbx_header_metadata(f, user_data_size):
+    """Parse GBX header user-data chunks to extract replay metadata.
+
+    Handles the chunk list structure that appears after the main GBX header
+    fields.  Returns a dict with any of: map_uid, map_author, race_time_ms,
+    player_nickname, player_login.  Missing fields are simply absent from the
+    dict — callers should use .get() with a default.
+    """
+    if user_data_size == 0:
+        return {}
+
+    user_data_start = f.tell()
+    metadata = {}
+
+    try:
+        num_chunks = read_uint32(f)
+        if num_chunks == 0 or num_chunks > 1000:
+            f.seek(user_data_start + user_data_size)
+            return {}
+
+        chunk_headers = []
+        for _ in range(num_chunks):
+            chunk_id = read_uint32(f)
+            chunk_size_raw = read_int32(f)
+            chunk_size = chunk_size_raw & 0x7FFFFFFF
+            chunk_headers.append({'id': chunk_id, 'size': chunk_size})
+
+        lookback = _LookbackReader()
+
+        for chunk in chunk_headers:
+            chunk_id = chunk['id']
+            chunk_size = chunk['size']
+            chunk_start = f.tell()
+
+            try:
+                if chunk_id == 0x03093000:
+                    # CGameCtnReplayRecord header — contains map info, time, player
+                    chunk_version = read_uint32(f)
+                    if chunk_version >= 4 and chunk_version != 9999:
+                        map_info = lookback.read_ident(f)
+                        if map_info[0]:
+                            metadata['map_uid'] = map_info[0]
+                        if map_info[2]:
+                            metadata['map_author'] = map_info[2]
+                    time = read_int32(f)
+                    if time >= 0:
+                        metadata['race_time_ms'] = time
+                    nickname = read_string(f)
+                    if nickname:
+                        metadata['player_nickname'] = nickname
+                    if chunk_version >= 6:
+                        login = read_string(f)
+                        if login:
+                            metadata['player_login'] = login
+            except Exception:
+                pass  # Skip unreadable individual chunks; outer loop continues
+
+            f.seek(chunk_start + chunk_size)
+
+    except Exception as e:
+        print(f"⚠ Could not parse GBX header metadata: {e}")
+    finally:
+        f.seek(user_data_start + user_data_size)
+
+    return metadata
 
 
 def parse_vehicle_vis_sample(time_ms, sample_data):
@@ -300,9 +401,8 @@ def parse_gbx_file(filepath):
         class_id = read_uint32(f)
         user_data_size = read_uint32(f)
         
-        # Skip header chunks
-        if user_data_size > 0:
-            f.read(user_data_size)
+        # Parse header chunks to extract map_uid, race_time_ms, player info
+        header_metadata = _parse_gbx_header_metadata(f, user_data_size)
         
         # Skip ref table
         num_external = read_int32(f)
@@ -429,7 +529,8 @@ def parse_gbx_file(filepath):
             'start_time': start_time,
             'end_time': end_time,
             'num_samples': len(samples),
-            'samples': samples
+            'samples': samples,
+            'header_metadata': header_metadata
         }
 
 
@@ -463,7 +564,8 @@ for filepath in gbx_files:
                 'start_time': result['start_time'],
                 'end_time': result['end_time'],
                 'num_samples': result['num_samples'],
-                'samples': result['samples']
+                'samples': result['samples'],
+                'header_metadata': result['header_metadata']
             })
             print(f"✓ Parsed {file_name}: {result['num_samples']} samples")
         else:
@@ -475,22 +577,31 @@ print(f"\nSuccessfully parsed {len(parsed_ghosts)} ghost files")
 
 
 # ========================================
-# Cell 3: Create ghost_header DataFrame
+# Cell 3: Create silver_replay_header DataFrame
 # ========================================
 
 if len(parsed_ghosts) > 0:
     header_rows = []
     
     for ghost in parsed_ghosts:
+        meta = ghost['header_metadata']
+        
+        # race_time_ms: use header value when available, fall back to end-start
+        raw_race_time = meta.get('race_time_ms', ghost['end_time'] - ghost['start_time'])
+        if raw_race_time < 0:
+            print(f"⚠ Negative race_time_ms ({raw_race_time}) for {ghost['file_name']} — clamping to 0")
+        race_time_ms = max(int(raw_race_time), 0)
+        
         header_rows.append({
-            'ghost_id': str(ghost['ghost_id']),
+            'replay_id': str(ghost['ghost_id']),
             'file_name': str(ghost['file_name']),
-            'player_nickname': str(''),  # Not available in standalone .Ghost.Gbx
-            'player_login': str(''),
-            'map_uid': str(''),
-            'map_author': str(''),
-            'race_time_ms': int(0),
-            'race_time_s': float(0.0),
+            'source': 'player',
+            'player_nickname': str(meta.get('player_nickname', '')),
+            'player_login': str(meta.get('player_login', '')),
+            'map_uid': str(meta.get('map_uid', '')),
+            'map_author': str(meta.get('map_author', '')),
+            'race_time_ms': race_time_ms,
+            'race_time_s': round(race_time_ms / 1000.0, 3),
             'start_time_ms': int(ghost['start_time']),
             'end_time_ms': int(ghost['end_time']),
             'num_samples': int(ghost['num_samples']),
@@ -501,9 +612,9 @@ if len(parsed_ghosts) > 0:
     df_header = spark.createDataFrame(header_rows)
     
     # Overwrite mode — safe to rerun without duplicates
-    df_header.write.format("delta").mode("overwrite").save("/lakehouse/default/Tables/ghost_header")
+    df_header.write.format("delta").mode("overwrite").save("/lakehouse/default/Tables/silver_replay_header")
     
-    print(f"✓ Wrote {len(header_rows)} rows to ghost_header table")
+    print(f"✓ Wrote {len(header_rows)} rows to silver_replay_header table")
     
     # Show sample
     df_header.show(5, truncate=False)
@@ -512,18 +623,18 @@ else:
 
 
 # ========================================
-# Cell 4: Create ghost_telemetry DataFrame
+# Cell 4: Create silver_replay_telemetry DataFrame
 # ========================================
 
 if len(parsed_ghosts) > 0:
     telemetry_rows = []
     
     for ghost in parsed_ghosts:
-        ghost_id = str(ghost['ghost_id'])
+        replay_id = str(ghost['ghost_id'])
         
         for sample in ghost['samples']:
             telemetry_rows.append({
-                'ghost_id': ghost_id,
+                'replay_id': replay_id,
                 'time_ms': int(sample['time_ms']),
                 'time_s': float(sample['time_s']),
                 'x': float(sample['x']),
@@ -591,14 +702,14 @@ if len(parsed_ghosts) > 0:
         
         # Overwrite on first batch (clears old data); append for the rest
         write_mode = "overwrite" if i == 0 else "append"
-        df_telemetry.write.format("delta").mode(write_mode).save("/lakehouse/default/Tables/ghost_telemetry")
+        df_telemetry.write.format("delta").mode(write_mode).save("/lakehouse/default/Tables/silver_replay_telemetry")
         
         print(f"✓ Wrote batch {i//batch_size + 1}: {len(batch)} rows")
     
     print(f"\n✓ Total telemetry rows written: {len(telemetry_rows)}")
     
     # Show sample
-    df_sample = spark.read.format("delta").load("/lakehouse/default/Tables/ghost_telemetry")
+    df_sample = spark.read.format("delta").load("/lakehouse/default/Tables/silver_replay_telemetry")
     df_sample.show(10, truncate=False)
 else:
     print("No telemetry data to ingest")
@@ -617,12 +728,12 @@ print(f"Total samples ingested: {sum(g['num_samples'] for g in parsed_ghosts)}")
 print("=" * 60)
 
 # Query the tables
-print("\nGhost Header Table:")
-spark.read.format("delta").load("/lakehouse/default/Tables/ghost_header").show(10, truncate=False)
+print("\nReplay Header Table:")
+spark.read.format("delta").load("/lakehouse/default/Tables/silver_replay_header").show(10, truncate=False)
 
-print("\nGhost Telemetry Table (sample):")
+print("\nReplay Telemetry Table (sample):")
 spark.sql("""
-    SELECT ghost_id, time_s, x, y, z, speed, steer, gas, brake
-    FROM delta.`/lakehouse/default/Tables/ghost_telemetry`
+    SELECT replay_id, time_s, x, y, z, speed, steer, gas, brake
+    FROM delta.`/lakehouse/default/Tables/silver_replay_telemetry`
     LIMIT 20
 """).show(20, truncate=False)

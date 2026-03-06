@@ -2,81 +2,57 @@
 Microsoft Fabric Notebook: Enrich silver_replay_header with Player Nicknames
 
 Reads rows from silver_replay_header where account_id is set but player_nickname
-is empty, looks up the display names via the Nadeo API in batches, and updates
-the table using a MERGE statement.
+is empty, looks up the display names via the Trackmania OAuth API in batches,
+and updates the table using a MERGE statement.
 
 Prerequisites:
-- A Ubisoft account (email + password) that has played Trackmania 2020
+- A registered OAuth app at https://api.trackmania.com (gives you client_id + client_secret)
 - silver_replay_header Delta table must already exist (run fabric_ghost_ingest.py first)
 
 Parameters (edit in Cell 1):
-- UBI_EMAIL    : Your Ubisoft account email
-- UBI_PASSWORD : Your Ubisoft account password
+- TM_CLIENT_ID     : Your Trackmania OAuth app Identifier
+- TM_CLIENT_SECRET : Your Trackmania OAuth app Secret
 """
 
 # ========================================
 # Cell 1: Parameters
 # ========================================
 
-UBI_EMAIL    = ""   # Your Ubisoft email
-UBI_PASSWORD = ""   # Your Ubisoft password
+TM_CLIENT_ID     = ""   # Your OAuth app Identifier
+TM_CLIENT_SECRET = ""   # Your OAuth app Secret
 
-# How many account IDs to look up per API call (max 50 per Nadeo API docs)
+# How many account IDs to look up per API call (max 50 per API docs)
 BATCH_SIZE = 50
 
 # ========================================
-# Cell 2: Authenticate with Ubisoft + Nadeo
+# Cell 2: Authenticate with Trackmania OAuth API
 # ========================================
 
 import requests
-import base64
-
-UBI_AUTH_URL   = "https://public-ubiservices.ubi.com/v3/profiles/sessions"
-NADEO_AUTH_URL = "https://prod.trackmania.core.nadeo.online/v2/authentication/token/ubiservices"
-UBI_APP_ID     = "86263886-327a-4328-ac69-527f0d20a237"
 
 USER_AGENT = "tm2020-gbx-parser / fabric-enrich-nicknames / contact via GitHub"
 
-# Step 1 — Get Ubisoft ticket
-basic_token = base64.b64encode(f"{UBI_EMAIL}:{UBI_PASSWORD}".encode()).decode()
-
 try:
-    ubi_response = requests.post(
-        UBI_AUTH_URL,
-        headers={
-            "Content-Type": "application/json",
-            "Ubi-AppId": UBI_APP_ID,
-            "Authorization": f"Basic {basic_token}",
-            "User-Agent": USER_AGENT,
-        }
-    )
-    ubi_response.raise_for_status()
-except Exception as e:
-    raise RuntimeError(f"Ubisoft authentication failed — check UBI_EMAIL / UBI_PASSWORD. Details: {e}")
-ubi_ticket = ubi_response.json()["ticket"]
-print("✓ Ubisoft ticket obtained")
-
-# Step 2 — Exchange for a NadeoServices token (used for display name lookup)
-try:
-    resp = requests.post(
-        NADEO_AUTH_URL,
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": f"ubi_v1 t={ubi_ticket}",
-            "User-Agent": USER_AGENT,
+    token_resp = requests.post(
+        "https://api.trackmania.com/api/access_token",
+        headers={"User-Agent": USER_AGENT},
+        data={
+            "grant_type": "client_credentials",
+            "client_id": TM_CLIENT_ID,
+            "client_secret": TM_CLIENT_SECRET,
         },
-        json={"audience": "NadeoServices"}
     )
-    resp.raise_for_status()
+    token_resp.raise_for_status()
 except Exception as e:
-    raise RuntimeError(f"Nadeo token exchange failed. Details: {e}")
-core_token = resp.json()["accessToken"]
+    raise RuntimeError(f"OAuth token request failed — check TM_CLIENT_ID / TM_CLIENT_SECRET. Details: {e}")
 
-CORE_HEADERS = {
-    "Authorization": f"nadeo_v1 t={core_token}",
+access_token = token_resp.json()["access_token"]
+
+API_HEADERS = {
+    "Authorization": f"Bearer {access_token}",
     "User-Agent": USER_AGENT,
 }
-print("✓ Nadeo token obtained")
+print("✓ OAuth token obtained")
 
 # ========================================
 # Cell 3: Find rows that need a nickname
@@ -98,21 +74,21 @@ print(f"Found {len(missing)} account(s) with no nickname")
 # Cell 4: Look up display names in batches
 # ========================================
 
-DISPLAY_NAMES_URL = "https://prod.trackmania.core.nadeo.online/accounts/displayNames/"
+DISPLAY_NAMES_URL = "https://api.trackmania.com/api/display-names"
 
-nicknames = {}  # account_id -> display_name
+nicknames = {}
 
 for i in range(0, len(missing), BATCH_SIZE):
     batch = missing[i:i + BATCH_SIZE]
     try:
         response = requests.get(
             DISPLAY_NAMES_URL,
-            headers=CORE_HEADERS,
-            params={"accountIdList": ",".join(batch)},
+            headers=API_HEADERS,
+            params=[("accountId[]", aid) for aid in batch],
         )
         response.raise_for_status()
-        for entry in response.json():
-            nicknames[entry["accountId"]] = entry["displayName"]
+        for account_id, display_name in response.json().items():
+            nicknames[account_id] = display_name
         print(f"  Batch {i // BATCH_SIZE + 1}: looked up {len(batch)} account(s)")
     except Exception as e:
         print(f"  ✗ Batch {i // BATCH_SIZE + 1} failed: {e} — skipping")
@@ -124,7 +100,6 @@ print(f"\n✓ Resolved {len(nicknames)} nickname(s)")
 # ========================================
 
 if nicknames:
-    # Build a small DataFrame of (account_id, player_nickname) to MERGE from
     updates = spark.createDataFrame(
         [{"account_id": k, "player_nickname": v} for k, v in nicknames.items()]
     )

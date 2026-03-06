@@ -236,6 +236,7 @@ for rec in all_records_to_download:
     record_id  = rec["record_id"]
     race_time  = rec["race_time"]
     position   = rec["position"]
+    account_id = rec["account_id"]
     replay_url = rec["replay_url"]
 
     out_dir = os.path.join(OUTPUT_BASE, "leaderboard", map_uid)
@@ -249,7 +250,7 @@ for rec in all_records_to_download:
 
     os.makedirs(out_dir, exist_ok=True)
 
-    file_name = f"pos{position:03d}_{race_time}_{record_id}.Replay.Gbx"
+    file_name = f"pos{position:03d}_{race_time}_{account_id}_{record_id}.Replay.Gbx"
     file_path = os.path.join(out_dir, file_name)
 
     if os.path.exists(file_path):

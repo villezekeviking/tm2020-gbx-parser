@@ -6,7 +6,7 @@ for each map you specify, and downloads the .Replay.Gbx files into the
 Lakehouse Files area.
 
 The downloaded replays land in:
-  /lakehouse/default/Files/replays/leaderboard/{map_id}/
+  /lakehouse/default/Files/replays/leaderboard/{map_uid}/
 
 From there, you can parse them with the existing tm_gbx parser
 and ingest into Delta tables.
@@ -18,7 +18,7 @@ Prerequisites:
 Parameters (edit in Cell 1):
 - UBI_EMAIL      : Your Ubisoft account email
 - UBI_PASSWORD   : Your Ubisoft account password
-- MAP_IDS        : List of map IDs to fetch leaderboard replays for
+- MAP_UIDS       : List of map UIDs to fetch leaderboard replays for
 - TOP_N_PER_MAP  : How many top leaderboard entries to download per map
 """
 
@@ -29,16 +29,17 @@ Parameters (edit in Cell 1):
 UBI_EMAIL    = ""   # Your Ubisoft email
 UBI_PASSWORD = ""   # Your Ubisoft password
 
-# List of map IDs to fetch leaderboard replays for.
-# You can find a map's ID in-game or via the Trackmania exchange website.
-MAP_IDS = [
-    # "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx",  # Example map ID — replace with real ones
+# List of map UIDs to fetch leaderboard replays for.
+# A map UID is the short ~27-character string you see in Trackmania URLs
+# or in-game (e.g. "KRelvYHRjEQoqnkJ_Th8FLKzTsg").  It is NOT the long UUID.
+MAP_UIDS = [
+    # "KRelvYHRjEQoqnkJ_Th8FLKzTsg",  # Example map UID — replace with real ones
 ]
 
 # How many top leaderboard entries to download per map (e.g. 5 or 10)
 TOP_N_PER_MAP = 5
 
-# Output folder in Lakehouse (leaderboard replays go under leaderboard/{map_id}/)
+# Output folder in Lakehouse (leaderboard replays go under leaderboard/{map_uid}/)
 OUTPUT_BASE = "/lakehouse/default/Files/replays"
 
 # ========================================
@@ -52,9 +53,11 @@ import os
 import shutil
 import time as _time
 
-UBI_AUTH_URL  = "https://public-ubiservices.ubi.com/v3/profiles/sessions"
+UBI_AUTH_URL   = "https://public-ubiservices.ubi.com/v3/profiles/sessions"
 NADEO_AUTH_URL = "https://prod.trackmania.core.nadeo.online/v2/authentication/token/ubiservices"
-UBI_APP_ID    = "86263886-327a-4328-ac69-527f0d20a237"
+UBI_APP_ID     = "86263886-327a-4328-ac69-527f0d20a237"
+
+USER_AGENT = "tm2020-gbx-parser / fabric-replay-download / contact via GitHub"
 
 # Step 1 — Get Ubisoft ticket
 basic_token = base64.b64encode(f"{UBI_EMAIL}:{UBI_PASSWORD}".encode()).decode()
@@ -65,82 +68,137 @@ ubi_response = requests.post(
         "Content-Type": "application/json",
         "Ubi-AppId": UBI_APP_ID,
         "Authorization": f"Basic {basic_token}",
-        "User-Agent": "tm2020-gbx-parser / fabric-replay-download / contact via GitHub"
+        "User-Agent": USER_AGENT,
     }
 )
 ubi_response.raise_for_status()
 ubi_ticket = ubi_response.json()["ticket"]
 print("✓ Ubisoft ticket obtained")
 
-# Step 2 — Exchange for Nadeo token (NadeoServices audience for core API)
-nadeo_response = requests.post(
-    NADEO_AUTH_URL,
-    headers={
-        "Content-Type": "application/json",
-        "Authorization": f"ubi_v1 t={ubi_ticket}",
-        "User-Agent": "tm2020-gbx-parser / fabric-replay-download / contact via GitHub"
-    },
-    json={"audience": "NadeoServices"}
-)
-nadeo_response.raise_for_status()
-nadeo_token = nadeo_response.json()["accessToken"]
-account_id  = nadeo_response.json()["accountId"]
+# Step 2 — Exchange for TWO Nadeo tokens:
+#   - NadeoLiveServices token → used to query the leaderboard (live-services host)
+#   - NadeoServices token     → used to look up map info and download replay URLs (core host)
+#
+# Note: the Nadeo token response only contains 'accessToken' and 'refreshToken'.
+# There is no 'accountId' field in the response.
 
-HEADERS = {
-    "Authorization": f"nadeo_v1 t={nadeo_token}",
-    "User-Agent": "tm2020-gbx-parser / fabric-replay-download / contact via GitHub"
+def get_nadeo_token(ubi_ticket, audience):
+    """Exchange a Ubisoft ticket for a Nadeo access token for the given audience."""
+    resp = requests.post(
+        NADEO_AUTH_URL,
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"ubi_v1 t={ubi_ticket}",
+            "User-Agent": USER_AGENT,
+        },
+        json={"audience": audience}
+    )
+    resp.raise_for_status()
+    return resp.json()["accessToken"]
+
+live_token = get_nadeo_token(ubi_ticket, "NadeoLiveServices")
+core_token = get_nadeo_token(ubi_ticket, "NadeoServices")
+
+# Build reusable headers for each service
+LIVE_HEADERS = {
+    "Authorization": f"nadeo_v1 t={live_token}",
+    "User-Agent": USER_AGENT,
+}
+CORE_HEADERS = {
+    "Authorization": f"nadeo_v1 t={core_token}",
+    "User-Agent": USER_AGENT,
 }
 
-print(f"✓ Nadeo token obtained for account: {account_id}")
+print("✓ NadeoLiveServices token obtained")
+print("✓ NadeoServices token obtained")
 
 # ========================================
 # Cell 3: Fetch Leaderboard Records
 # ========================================
 
-# Base URLs for the two API calls we need per map:
-#   1. Leaderboard tops   — returns the top N player positions + account IDs for a map
-#   2. Map records lookup — returns the actual records (including replay URL) for those account IDs
-LEADERBOARD_URL = "https://prod.trackmania.core.nadeo.online/v2/leaderboard/groups/Personal_Best/maps/{map_id}/tops"
-MAP_RECORDS_URL  = "https://prod.trackmania.core.nadeo.online/v2/mapRecords/"
+# For each map UID we need three API calls:
+#
+#   A. Map info lookup (core API)
+#      GET https://prod.trackmania.core.nadeo.online/maps/?mapUidList={map_uid}
+#      → returns the internal map UUID (mapId) we need for records lookup
+#
+#   B. Leaderboard top N (live API)
+#      GET https://live-services.trackmania.nadeo.live/api/token/leaderboard/group/Personal_Best/map/{map_uid}/top
+#      → returns top N entries with accountId, position, and score (race time in ms)
+#
+#   C. Map records with replay URLs (core API)
+#      GET https://prod.trackmania.core.nadeo.online/mapRecords/
+#      → returns records including the 'url' field for downloading the replay
+
+MAP_INFO_URL      = "https://prod.trackmania.core.nadeo.online/maps/"
+LEADERBOARD_URL   = "https://live-services.trackmania.nadeo.live/api/token/leaderboard/group/Personal_Best/map/{map_uid}/top"
+MAP_RECORDS_URL   = "https://prod.trackmania.core.nadeo.online/mapRecords/"
 
 # We'll collect all records to download across all maps here
-all_records_to_download = []  # list of dicts: {map_id, account_id, record_id, race_time, replay_url, position}
+all_records_to_download = []  # list of dicts: {map_uid, map_uuid, account_id, record_id, race_time, replay_url, position}
 
-for map_id in MAP_IDS:
-    print(f"\n── Map: {map_id}")
+for map_uid in MAP_UIDS:
+    print(f"\n── Map UID: {map_uid}")
 
-    # --- Step A: Fetch the leaderboard top N for this map ---
-    # "onlyWorld=true" means we get the global top, not regional
+    # --- Step A: Look up the internal map UUID from the map UID ---
+    # The records endpoint requires the UUID (long form), not the UID (short form).
+    map_info_response = requests.get(
+        MAP_INFO_URL,
+        params={"mapUidList": map_uid},
+        headers=CORE_HEADERS,
+    )
+    map_info_response.raise_for_status()
+    map_info_list = map_info_response.json()
+
+    if not map_info_list:
+        print(f"  ⚠ Map info not found for UID {map_uid} — skipping")
+        continue
+
+    map_uuid = map_info_list[0]["mapId"]
+    print(f"  ✓ Resolved map UUID: {map_uuid}")
+
+    _time.sleep(0.6)
+
+    # --- Step B: Fetch the leaderboard top N for this map ---
+    # "onlyWorld=true" means we get the global top, not regional.
+    # The response time field is called "score" (milliseconds).
     leaderboard_response = requests.get(
-        LEADERBOARD_URL.format(map_id=map_id),
-        params={"length": TOP_N_PER_MAP, "onlyWorld": "true"},
-        headers=HEADERS
+        LEADERBOARD_URL.format(map_uid=map_uid),
+        params={"onlyWorld": "true", "length": TOP_N_PER_MAP},
+        headers=LIVE_HEADERS,
     )
     leaderboard_response.raise_for_status()
     tops = leaderboard_response.json().get("tops", [])
 
     if not tops:
-        print(f"  ⚠ No leaderboard entries found for map {map_id}")
+        print(f"  ⚠ No leaderboard entries found for map {map_uid}")
         continue
 
     # tops is a list of zone-grouped entries; the first entry is the world top
     world_top = tops[0].get("top", [])
     print(f"  ✓ Leaderboard returned {len(world_top)} entries")
 
-    # Collect the account IDs of the top players
+    # Collect the account IDs and positions of the top players
     account_ids = [entry["accountId"] for entry in world_top]
     positions   = {entry["accountId"]: entry["position"] for entry in world_top}
+    # The race time is stored in the "score" field (milliseconds)
+    scores      = {entry["accountId"]: entry["score"] for entry in world_top}
 
-    # --- Step B: Fetch the actual map records for those account IDs ---
-    # This gives us the replay download URLs
+    _time.sleep(0.6)
+
+    # --- Step C: Fetch the actual map records for those account IDs ---
+    # This gives us the replay download URLs.
+    # IMPORTANT: use /mapRecords/ (no /v2/ prefix) — the /v2/mapRecords/ endpoint
+    # returns 400 "Missing mapId parameter".
     records_response = requests.get(
         MAP_RECORDS_URL,
+<parameter name="new_str">    records_response = requests.get(
+        MAP_RECORDS_URL,
         params={
-            "mapIdList":     map_id,
+            "mapIdList":     map_uuid,
             "accountIdList": ",".join(account_ids),
-            "seasonId":      "Personal_Best"
         },
-        headers=HEADERS
+        headers=CORE_HEADERS,
     )
     records_response.raise_for_status()
     map_records = records_response.json()
@@ -151,10 +209,11 @@ for map_id in MAP_IDS:
     for rec in map_records:
         acc_id = rec.get("accountId", "")
         all_records_to_download.append({
-            "map_id":     rec.get("mapId", map_id),
+            "map_uid":    map_uid,
+            "map_uuid":   map_uuid,
             "account_id": acc_id,
             "record_id":  rec.get("mapRecordId", ""),
-            "race_time":  rec.get("recordScore", {}).get("time", 0),
+            "race_time":  scores.get(acc_id, 0),
             "replay_url": rec.get("url", ""),
             "position":   positions.get(acc_id, 0),
         })
@@ -167,7 +226,7 @@ print(f"\n✓ Total records to download: {len(all_records_to_download)}")
 # Show a preview of what we'll download
 for rec in all_records_to_download:
     time_s = rec["race_time"] / 1000
-    print(f"  #{rec['position']:>3}  Map: {rec['map_id'][:12]}...  Account: {rec['account_id'][:8]}...  Time: {time_s:.3f}s")
+    print(f"  #{rec['position']:>3}  Map: {rec['map_uid'][:12]}...  Account: {rec['account_id'][:8]}...  Time: {time_s:.3f}s")
 
 # ========================================
 # Cell 4: Download Replay Files
@@ -177,33 +236,33 @@ for rec in all_records_to_download:
 # clean out and re-download each map's folder on every run.  This ensures the
 # files always reflect the current top N — old entries won't linger.
 #
-# Output path per map:  replays/leaderboard/{map_id}/
+# Output path per map:  replays/leaderboard/{map_uid}/
 #   File name format:   pos{position:03d}_{race_time_ms}_{record_id}.Replay.Gbx
 
 downloaded = []
 skipped    = []
 failed     = []
 
-# Group records by map so we can clean one folder at a time
+# Track which map folders we've already cleaned in this run
 maps_seen = set()
 
 for rec in all_records_to_download:
-    map_id     = rec["map_id"]
+    map_uid    = rec["map_uid"]
     record_id  = rec["record_id"]
     race_time  = rec["race_time"]
     position   = rec["position"]
     replay_url = rec["replay_url"]
 
-    # Build output path: replays/leaderboard/{map_id}/
-    out_dir = os.path.join(OUTPUT_BASE, "leaderboard", map_id)
+    # Build output path: replays/leaderboard/{map_uid}/
+    out_dir = os.path.join(OUTPUT_BASE, "leaderboard", map_uid)
 
     # On first encounter of this map in the current run, wipe the folder so
     # stale entries from a previous run don't accumulate.
-    if map_id not in maps_seen:
+    if map_uid not in maps_seen:
         if os.path.exists(out_dir):
             shutil.rmtree(out_dir)
-            print(f"🧹 Cleaned stale folder: leaderboard/{map_id}/")
-        maps_seen.add(map_id)
+            print(f"🧹 Cleaned stale folder: leaderboard/{map_uid}/")
+        maps_seen.add(map_uid)
 
     os.makedirs(out_dir, exist_ok=True)
 
@@ -223,9 +282,9 @@ for rec in all_records_to_download:
         print(f"✗ No replay URL for record {record_id}")
         continue
 
-    # Download the replay file
+    # Download the replay file (replay URLs are direct S3/CDN links — no auth needed)
     try:
-        replay_response = requests.get(replay_url, headers=HEADERS)
+        replay_response = requests.get(replay_url)
         replay_response.raise_for_status()
 
         with open(file_path, "wb") as f:
@@ -249,7 +308,7 @@ for rec in all_records_to_download:
 print("=" * 60)
 print("DOWNLOAD SUMMARY")
 print("=" * 60)
-print(f"Maps processed  : {len(MAP_IDS)}")
+print(f"Maps processed  : {len(MAP_UIDS)}")
 print(f"Top N per map   : {TOP_N_PER_MAP}")
 print(f"Records found   : {len(all_records_to_download)}")
 print(f"Downloaded      : {len(downloaded)}")

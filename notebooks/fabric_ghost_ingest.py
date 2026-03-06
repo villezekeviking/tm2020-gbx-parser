@@ -1,11 +1,15 @@
 """
 Microsoft Fabric Notebook: TrackMania 2020 Ghost Telemetry Ingestion
 
-This notebook reads .Ghost.Gbx files from the Lakehouse Files area and creates
-two Delta tables with ghost metadata and telemetry data (52 fields per sample).
+This notebook reads .Replay.Gbx and .Ghost.Gbx files from the Lakehouse Files
+area and creates two Delta tables with ghost metadata and telemetry data
+(52 fields per sample). The parser works on both file types since it locates
+the CPlugEntRecordData chunk by byte signature rather than relying on the
+file extension.
 
 Prerequisites:
-- .Ghost.Gbx files in /lakehouse/default/Files/ghosts/
+- .Replay.Gbx (or .Ghost.Gbx) files in /lakehouse/default/Files/replays/
+  (as written by fabric_replay_download.py, in {year}/{month}/{map_id}/ subfolders)
 - Write access to /lakehouse/default/Tables/
 
 Output:
@@ -535,17 +539,20 @@ def parse_gbx_file(filepath):
 
 
 # ========================================
-# Cell 2: Read and Parse .Ghost.Gbx Files
+# Cell 2: Read and Parse .Replay.Gbx and .Ghost.Gbx Files
 # ========================================
 
-# Input directory
-input_dir = "/lakehouse/default/Files/ghosts/"
+# Input directory — matches the output of fabric_replay_download.py
+input_dir = "/lakehouse/default/Files/replays/"
 
-# Get list of .Ghost.Gbx files
-import glob
-gbx_files = glob.glob(os.path.join(input_dir, "*.Ghost.Gbx"))
+# Recursively find all .Replay.Gbx and .Ghost.Gbx files
+gbx_files = []
+for root, dirs, files in os.walk(input_dir):
+    for f in files:
+        if f.endswith(".Replay.Gbx") or f.endswith(".Ghost.Gbx"):
+            gbx_files.append(os.path.join(root, f))
 
-print(f"Found {len(gbx_files)} .Ghost.Gbx files")
+print(f"Found {len(gbx_files)} .Replay.Gbx / .Ghost.Gbx files")
 
 # Parse all files
 parsed_ghosts = []

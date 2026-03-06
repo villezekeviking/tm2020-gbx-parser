@@ -135,7 +135,7 @@ LEADERBOARD_URL   = "https://live-services.trackmania.nadeo.live/api/token/leade
 MAP_RECORDS_URL   = "https://prod.trackmania.core.nadeo.online/mapRecords/"
 
 # We'll collect all records to download across all maps here
-all_records_to_download = []  # list of dicts: {map_uid, map_uuid, account_id, record_id, race_time, replay_url, position}
+all_records_to_download = []
 
 for map_uid in MAP_UIDS:
     print(f"\n── Map UID: {map_uid}")
@@ -192,8 +192,6 @@ for map_uid in MAP_UIDS:
     # returns 400 "Missing mapId parameter".
     records_response = requests.get(
         MAP_RECORDS_URL,
-<parameter name="new_str">    records_response = requests.get(
-        MAP_RECORDS_URL,
         params={
             "mapIdList":     map_uuid,
             "accountIdList": ",".join(account_ids),
@@ -226,7 +224,7 @@ print(f"\n✓ Total records to download: {len(all_records_to_download)}")
 # Show a preview of what we'll download
 for rec in all_records_to_download:
     time_s = rec["race_time"] / 1000
-    print(f"  #{rec['position']:>3}  Map: {rec['map_uid'][:12]}...  Account: {rec['account_id'][:8]}...  Time: {time_s:.3f}s")
+    print(f"  #{{rec['position']:>3}}  Map: {{rec['map_uid'][:12]}}...  Account: {{rec['account_id'][:8]}}...  Time: {{time_s:.3f}}s")
 
 # ========================================
 # Cell 4: Download Replay Files
@@ -261,30 +259,30 @@ for rec in all_records_to_download:
     if map_uid not in maps_seen:
         if os.path.exists(out_dir):
             shutil.rmtree(out_dir)
-            print(f"🧹 Cleaned stale folder: leaderboard/{map_uid}/")
+            print(f"🧹 Cleaned stale folder: leaderboard/{{map_uid}}/")
         maps_seen.add(map_uid)
 
     os.makedirs(out_dir, exist_ok=True)
 
     # File name encodes leaderboard position and race time so it's self-describing
-    file_name = f"pos{position:03d}_{race_time}_{record_id}.Replay.Gbx"
+    file_name = f"pos{{position:03d}}_{{race_time}}_{{record_id}}.Replay.Gbx"
     file_path = os.path.join(out_dir, file_name)
 
     # Skip if already downloaded (can happen if the same record appears twice)
     if os.path.exists(file_path):
         skipped.append(file_name)
-        print(f"⏭ Already exists: {file_name}")
+        print(f"⏭ Already exists: {{file_name}}")
         continue
 
     # Check that there is actually a replay URL to download
     if not replay_url:
         failed.append((file_name, "No replay URL in record"))
-        print(f"✗ No replay URL for record {record_id}")
+        print(f"✗ No replay URL for record {{record_id}}")
         continue
 
-    # Download the replay file (replay URLs are direct S3/CDN links — no auth needed)
+    # Download the replay file
     try:
-        replay_response = requests.get(replay_url)
+        replay_response = requests.get(replay_url, headers=CORE_HEADERS)
         replay_response.raise_for_status()
 
         with open(file_path, "wb") as f:
@@ -292,11 +290,11 @@ for rec in all_records_to_download:
 
         size_kb = len(replay_response.content) / 1024
         downloaded.append(file_name)
-        print(f"✓ Downloaded #{position:>3}: {file_name} ({size_kb:.1f} KB)")
+        print(f"✓ Downloaded #{{position:>3}}: {{file_name}} ({{size_kb:.1f}} KB)")
 
     except requests.exceptions.HTTPError as e:
         failed.append((file_name, str(e)))
-        print(f"✗ Failed #{position}: {file_name} — {e}")
+        print(f"✗ Failed #{{position}}: {{file_name}} — {{e}}")
 
     # Respect the Nadeo rate limit (~2 requests/second)
     _time.sleep(0.6)
@@ -308,19 +306,19 @@ for rec in all_records_to_download:
 print("=" * 60)
 print("DOWNLOAD SUMMARY")
 print("=" * 60)
-print(f"Maps processed  : {len(MAP_UIDS)}")
-print(f"Top N per map   : {TOP_N_PER_MAP}")
-print(f"Records found   : {len(all_records_to_download)}")
-print(f"Downloaded      : {len(downloaded)}")
-print(f"Already existed : {len(skipped)}")
-print(f"Failed          : {len(failed)}")
-print(f"Output folder   : {OUTPUT_BASE}/leaderboard/")
+print(f"Maps processed  : {{len(MAP_UIDS)}}")
+print(f"Top N per map   : {{TOP_N_PER_MAP}}")
+print(f"Records found   : {{len(all_records_to_download)}}")
+print(f"Downloaded      : {{len(downloaded)}}")
+print(f"Already existed : {{len(skipped)}}")
+print(f"Failed          : {{len(failed)}}")
+print(f"Output folder   : {{OUTPUT_BASE}}/leaderboard/")
 print("=" * 60)
 
 if failed:
     print("\nFailed downloads:")
     for name, err in failed:
-        print(f"  ✗ {name}: {err}")
+        print(f"  ✗ {{name}}: {{err}}")
 
 # List all downloaded files
 print("\nFiles in Lakehouse:")
@@ -329,4 +327,4 @@ if os.path.exists(leaderboard_dir):
     for root, dirs, files in os.walk(leaderboard_dir):
         for f in files:
             rel = os.path.relpath(os.path.join(root, f), OUTPUT_BASE)
-            print(f"  📄 {rel}")
+            print(f"  📄 {{rel}}")

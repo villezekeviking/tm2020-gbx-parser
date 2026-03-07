@@ -1,277 +1,247 @@
 # TM2020 GBX Parser
 
-Pure-Python parser for TrackMania 2020 GBX files (`.Ghost.Gbx` ghost files and `.Gbx` replay files). Extracts rich 52-field telemetry data from ghost recordings. Designed for Microsoft Fabric Lakehouse pipelines and standard Python environments.
+> Pure-Python parser for TrackMania 2020 `.Gbx` / `.Ghost.Gbx` replay files — extracts 52-field telemetry at 20 Hz and feeds a Microsoft Fabric Lakehouse Medallion pipeline.
+
+![Python](https://img.shields.io/badge/python-3.7%2B-blue) ![License](https://img.shields.io/github/license/villezekeviking/tm2020-gbx-parser)
 
 ## Features
 
-- **Pure Python**: No external dependencies (uses only Python stdlib: struct, zlib, io, math, os, hashlib, datetime)
-- **Rich Telemetry**: Extracts 52 fields per sample including position, velocity, rotation, inputs, suspension, tire conditions, reactor state, and more
-- **Fabric-ready**: Includes complete Lakehouse ingestion notebook for Delta tables
-- **Simple API**: Single `parse_gbx(filepath)` function
-- **Extracts**:
-  - Header metadata: player nickname, login, race time, map UID
-  - Ghost info: start/end time, sample count, version
-  - Telemetry samples: 52 fields at 50ms intervals (20Hz)
+- **Pure Python** — stdlib only (`struct`, `zlib`, `io`); no native dependencies for `.Ghost.Gbx` files
+- **52-field telemetry** — position, velocity, rotation, inputs, suspension, tire conditions, reactor state at 50 ms intervals
+- **Dual compression** — zlib (`.Ghost.Gbx`) and optional LZO (legacy `.Replay.Gbx`) support
+- **Medallion Architecture** — Bronze → Silver → Gold Fabric notebooks included
+- **Power BI ready** — Gold layer writes a star-schema optimised for dashboards
 
-## Installation
+---
 
-### Basic Installation
+## Pipeline Overview
+
+```mermaid
+flowchart LR
+    A([Nadeo API]) --> B[Bronze_01\nDownload replays]
+    B --> C[Silver_01\nParse & ingest]
+    C --> D[Silver_02\nEnrich nicknames]
+    D --> E[Gold_01\nSpine + spatial mapping]
+    E --> F([Power BI])
+```
+
+---
+
+## Notebooks
+
+| Step | Notebook | Layer | What it does |
+|------|----------|-------|--------------|
+| 1 | `Bronze_01_replay_download` | Bronze | Authenticates with Ubisoft/Nadeo APIs, fetches leaderboard top N + tracked players, downloads `.Replay.Gbx` files |
+| 2 | `Silver_01_ghost_ingest` | Silver | Parses `.Gbx`/`.Ghost.Gbx` files → three Silver Delta tables |
+| 3 | `Silver_02_enrich_nicknames` | Silver | Batch-looks up Trackmania display names, MERGE-updates `silver_replay_header` |
+| 4 | `Gold_01_build_gold_layer` | Gold | Builds track spine, assigns checkpoint sections, spatially maps telemetry to spine, writes Gold tables |
+
+### Notebook Data Flow
+
+```mermaid
+flowchart LR
+    NAD([Nadeo / Ubisoft APIs])
+    B01[Bronze_01_replay_download]
+    S01[Silver_01_ghost_ingest]
+    S02[Silver_02_enrich_nicknames]
+    G01[Gold_01_build_gold_layer]
+    SRH[(silver_replay_header)]
+    SRT[(silver_replay_telemetry)]
+    SRC[(silver_replay_checkpoints)]
+    GRH[(gold_replay_header)]
+    GTS[(gold_track_spine)]
+    GTT[(gold_replay_telemetry)]
+
+    NAD --> B01
+    B01 -->|.Replay.Gbx files| S01
+    S01 --> SRH & SRT & SRC
+    SRH --> S02
+    S02 --> SRH
+    SRH & SRT & SRC --> G01
+    G01 --> GRH & GTS & GTT
+```
+
+---
+
+## Delta Tables
+
+| Layer | Table | Key columns | Description |
+|-------|-------|-------------|-------------|
+| Silver | `silver_replay_header` | `replay_id`, `account_id`, `map_uid`, `race_time_ms` | One row per replay — metadata and player info |
+| Silver | `silver_replay_telemetry` | `replay_id`, `time_ms`, `x/y/z`, `speed` | One row per sample (52 fields at ~50 ms) |
+| Silver | `silver_replay_checkpoints` | `replay_id`, `cp_index`, `time_ms` | Checkpoint crossing times per replay |
+| Gold | `gold_replay_header` | `replay_id`, `player_nickname`, `source` | Silver header copy + ingestion timestamp |
+| Gold | `gold_track_spine` | `track_point_id`, `map_uid`, `checkpoint_section`, `x/y/z` | Track dimension — spatial reference for each map |
+| Gold | `gold_replay_telemetry` | `replay_id`, `track_point_id`, `distance_to_spine` | All 52 fields mapped to spine + distance metrics |
+
+---
+
+## Track Spine & Spatial Mapping
+
+The **track spine** is one reference run per map (defaults to the slowest replay for a smoother line, overridable). Every telemetry point is tagged with a `checkpoint_section` and spatially matched to the nearest spine point **within the same section**.
+
+> [!NOTE]
+> **Why space over time?** At t = 13 s, two players may be at entirely different track positions. By mapping all telemetry to the *same place* on the track, you can compare braking points, speed profiles, and racing lines — not just race times.
+
+```mermaid
+flowchart LR
+    R([Silver replays]) --> SEL{Select\nspine replay}
+    SEL -->|one per map| SP[(gold_track_spine)]
+    R --> CP[Tag checkpoint\nsections]
+    CP --> MAP[Nearest-neighbour\nmatch within section]
+    SP --> MAP
+    MAP --> GTT[(gold_replay_telemetry\n+ track_point_id\n+ distance_to_spine)]
+```
+
+| Column | Formula |
+|--------|---------|
+| `distance_per_sample` | `speed × 0.05` (50 ms window) |
+| `cumulative_distance` | running sum per replay ordered by `time_ms` |
+| `distance_to_spine` | 3D Euclidean distance to matched spine point |
+
+> [!TIP]
+> **Checkpoint section optimisation** — matching only within the same CP section dramatically reduces computation and provides a natural Power BI slicer for per-section analysis.
+
+---
+
+## Power BI Data Model
+
+Connect Power BI to the three Gold tables only.
+
+```mermaid
+erDiagram
+    gold_replay_header {
+        string replay_id PK
+        string map_uid
+        string player_nickname
+        int race_time_ms
+    }
+    gold_replay_telemetry {
+        string replay_id FK
+        int track_point_id FK
+        int time_ms
+        float x
+        float y
+        float z
+        float speed
+    }
+    gold_track_spine {
+        int track_point_id PK
+        string map_uid
+        int checkpoint_section
+        float x
+        float y
+        float z
+    }
+    gold_replay_header ||--o{ gold_replay_telemetry : "replay_id"
+    gold_replay_telemetry }o--|| gold_track_spine : "track_point_id"
+```
+
+---
+
+## Parser Library
+
+### Installation
+
 ```bash
 pip install -e .
+# Optional: LZO support for legacy .Replay.Gbx files
+pip install "python-lzo>=1.14"
 ```
 
-### Development Installation
-```bash
-pip install -e ".[dev]"
-```
-
-**Note**: For legacy replay `.Gbx` files with LZO-compressed body, `python-lzo>=1.14` can be optionally installed. New `.Ghost.Gbx` files use zlib compression (no LZO needed).
-
-## Usage
-
-### Basic Usage
+### Usage
 
 ```python
 from tm_gbx import parse_gbx
 
-# Parse a ghost file
-result = parse_gbx('replay.Ghost.Gbx')
+result = parse_gbx("replay.Ghost.Gbx")
 
-# Access metadata
-print(f"Player: {result['metadata']['player_nickname']}")
-print(f"Time: {result['metadata']['race_time_ms']} ms")
-print(f"Map: {result['metadata']['map_uid']}")
+print(result["metadata"]["player_nickname"])   # e.g. "Wirtual"
+print(result["metadata"]["race_time_ms"])      # e.g. 47832
+print(result["ghost_info"]["num_samples"])     # e.g. 958
 
-# Access ghost info
-print(f"Samples: {result['ghost_info']['num_samples']}")
-print(f"Duration: {result['ghost_info']['start_time']}-{result['ghost_info']['end_time']} ms")
-
-# Access ghost telemetry (52 fields per sample)
-for sample in result['ghost_samples'][:10]:
-    print(f"t={sample['time_ms']}ms: pos=({sample['x']:.2f}, {sample['y']:.2f}, {sample['z']:.2f}), "
-          f"speed={sample['speed']:.2f}, steer={sample['steer']:.2f}, gas={sample['gas']:.2f}")
+for sample in result["ghost_samples"][:3]:
+    print(sample["time_ms"], sample["x"], sample["y"], sample["z"], sample["speed"])
 ```
 
-### Microsoft Fabric Lakehouse Ingestion
+> [!TIP]
+> The `speed` field is Trackmania's native unit (`exp(i16/1000)`). Convert to km/h with `speed_kmh = speed * 3.6`.
 
-The parser includes a complete Fabric notebook for ingesting `.Ghost.Gbx` files into Delta tables. See `notebooks/fabric_ghost_ingest.py`.
+<details>
+<summary>52 telemetry fields per sample</summary>
 
-**Input**: `.Ghost.Gbx` files in `/lakehouse/default/Files/ghosts/`
+| Field | Type | Description |
+|-------|------|-------------|
+| `time_ms` / `time_s` | int / float | Sample timestamp |
+| `x`, `y`, `z` | float | Position (metres) |
+| `speed` | float | Speed (native units) |
+| `side_speed` | float | Lateral speed |
+| `vel_x`, `vel_y`, `vel_z` | float | Velocity vector |
+| `pitch_deg`, `yaw_deg`, `roll_deg` | float | Euler angles (degrees) |
+| `steer` | float | Steering [-1, 1] |
+| `gas` | float | Gas pedal [0, 1] |
+| `brake` | float | Brake pedal [0, 1] |
+| `gear` | float | Current gear |
+| `rpm` | int | Engine RPM (0–255) |
+| `is_turbo` | bool | Turbo active |
+| `turbo_time` | float | Turbo charge [0, 1] |
+| `reactor_state` | int | 0=off 1=ground 2=up 3=down |
+| `reactor_boost` | int | Boost level 0–2 |
+| `reactor_pedal` | int | −1=brake 0=none 1=accel |
+| `reactor_steer` | int | −1=left 0=none 1=right |
+| `is_ground_contact` | bool | Wheels on ground |
+| `is_top_contact` | bool | Roof contact |
+| `sim_time_coef` | float | Simulation time coefficient |
+| `wetness` | float | Surface wetness [0, 1] |
+| `fl/fr/rr/rl_dampen` | float | Suspension compression (4 wheels) |
+| `fl/fr/rr/rl_ice` | float | Ice coefficient [0, 1] (4 wheels) |
+| `fl/fr/rr/rl_dirt` | float | Dirt coefficient [0, 1] (4 wheels) |
+| `fl/fr/rr/rl_slip` | bool | Wheel slip (4 wheels) |
+| `fl/fr/rr/rl_ground_mat` | int | Surface material ID (4 wheels) |
+| `fl/fr/rr/rl_wheel_rot` | float | Wheel rotation in radians (4 wheels) |
 
-**Output**: Two Delta tables
-- `ghost_header`: Metadata (one row per ghost file)
-- `ghost_telemetry`: Telemetry samples (one row per sample, 52 fields)
-
-```python
-# The Fabric notebook handles:
-# - Batch ingestion of multiple .Ghost.Gbx files
-# - Parsing with inline logic (no pip install needed)
-# - Creating properly-typed Spark DataFrames
-# - Writing to Delta tables in append mode
-# - Summary reporting
-```
-
-## Data Format
-
-The `parse_gbx()` function returns a dictionary with:
-
-```python
-{
-    'metadata': {
-        'player_login': str,          # Player login ID
-        'player_nickname': str,       # Player display name
-        'map_uid': str,               # Map unique ID
-        'race_time_ms': int,          # Race time in milliseconds
-        'title_id': str,              # Game title ID
-        # ... additional header fields
-    },
-    'ghost_info': {
-        'start_time': int,            # Recording start time (ms)
-        'end_time': int,              # Recording end time (ms)
-        'num_samples': int,           # Number of telemetry samples
-        'sample_period_ms': int,      # Time between samples (50ms)
-        'version': int                # Record format version
-    },
-    'ghost_samples': [
-        {
-            # Time
-            'time_ms': int,           # Sample timestamp (ms)
-            'time_s': float,          # Sample timestamp (seconds)
-            
-            # Position & Velocity
-            'x': float, 'y': float, 'z': float,  # Position (meters)
-            'speed': float,           # Speed (game units, NOT km/h)
-            'side_speed': float,      # Lateral speed
-            'vel_x': float, 'vel_y': float, 'vel_z': float,  # Velocity vector
-            
-            # Rotation (Euler angles)
-            'pitch_deg': float,       # Pitch (degrees)
-            'yaw_deg': float,         # Yaw (degrees)
-            'roll_deg': float,        # Roll (degrees)
-            
-            # Inputs
-            'steer': float,           # Steering input [-1, 1]
-            'gas': float,             # Gas pedal [0, 1]
-            'brake': float,           # Brake pedal [0, 1]
-            'gear': float,            # Current gear
-            'rpm': int,               # Engine RPM (0-255)
-            
-            # Turbo & Reactor
-            'is_turbo': bool,         # Turbo active
-            'turbo_time': float,      # Turbo charge [0, 1]
-            'reactor_state': int,     # Reactor state (0=off, 1=ground, 2=up, 3=down)
-            'reactor_boost': int,     # Reactor boost level (0, 1, 2)
-            'reactor_pedal': int,     # Reactor pedal (-1=brake, 0=none, 1=accel)
-            'reactor_steer': int,     # Reactor steer (-1=left, 0=none, 1=right)
-            
-            # Contact & Simulation
-            'is_ground_contact': bool,  # Wheels on ground
-            'is_top_contact': bool,     # Roof contact
-            'sim_time_coef': float,     # Simulation time coefficient
-            'wetness': float,           # Surface wetness [0, 1]
-            
-            # Per-wheel Suspension (FL=Front-Left, FR=Front-Right, etc.)
-            'fl_dampen': float, 'fr_dampen': float,  # Suspension compression
-            'rr_dampen': float, 'rl_dampen': float,
-            
-            # Per-wheel Surface Conditions
-            'fl_ice': float, 'fr_ice': float,        # Ice [0, 1]
-            'rr_ice': float, 'rl_ice': float,
-            'fl_dirt': float, 'fr_dirt': float,      # Dirt [0, 1]
-            'rr_dirt': float, 'rl_dirt': float,
-            'fl_slip': bool, 'fr_slip': bool,        # Wheel slip
-            'rr_slip': bool, 'rl_slip': bool,
-            'fl_ground_mat': int, 'fr_ground_mat': int,  # Surface material ID
-            'rr_ground_mat': int, 'rl_ground_mat': int,
-            
-            # Per-wheel Rotation
-            'fl_wheel_rot': float, 'fr_wheel_rot': float,  # Wheel rotation (radians)
-            'rr_wheel_rot': float, 'rl_wheel_rot': float
-        },
-        # ... more samples (typically 500-1000 per ghost)
-    ]
-}
-```
-
-**Note**: The `speed` field is the game's native speed unit (`exp(i16/1000)`), NOT km/h. Convert to km/h with `speed_kmh = speed * 3.6` if needed.
-
-## Architecture Notes
-
-This parser is based on reverse-engineering the [gbx-net](https://github.com/BigBang1112/gbx-net) C# reference implementation, specifically:
-- `CPlugEntRecordData.cs` (chunk 0x0911F000) - Ghost record container
-- `CSceneVehicleVis.cs` (entity 0x0A018000) - Vehicle telemetry samples (107 bytes each)
-- `GbxBodyReader.cs` - Binary reading and compression
-
-### GBX File Structure
-
-**For `.Ghost.Gbx` files:**
-1. **Header**: Magic bytes (`GBX`), version, class ID, header chunks (metadata)
-2. **Reference Table**: External node references (usually empty)
-3. **Body**: **zlib-compressed** chunk data
-4. **CPlugEntRecordData chunk (0x0911F000)**: Contains ghost record
-   - Version (u32)
-   - Inner data (zlib-compressed): EntRecordDescs, NoticeRecordDescs, Entity list
-   - CSceneVehicleVis entity (0x0A018000): Contains 107-byte telemetry samples
-
-**For legacy replay `.Gbx` files:**
-- Body may use LZO compression instead of zlib (requires optional `python-lzo` package)
-- Same CPlugEntRecordData structure inside the decompressed body
+</details>
 
 ### Modules
 
-- `tm_gbx.reader` - Binary reading primitives (uint8, int32, float, string)
-- `tm_gbx.lookback` - GBX string interning system
-- `tm_gbx.header` - Header and metadata chunk parsing
-- `tm_gbx.ghost` - Ghost telemetry extraction (CPlugEntRecordData → CSceneVehicleVis)
-- `tm_gbx.parser` - Main `parse_gbx()` entry point
-
-## Testing
-
-```bash
-pytest tests/test_parser.py -v
-```
-
-Tests validate parsing on 8 real replay files in the `tests/` directory.
-
-## Lakehouse Pipeline
-
-This parser is part of a Microsoft Fabric Lakehouse pipeline for TrackMania 2020 ghost analytics using the **Medallion Architecture**:
-
-- **Bronze Layer** (`tm2020_bronze`): Raw GBX file ingestion
-- **Silver Layer** (`tm2020_silver`): Cleaned and normalized telemetry tables
-- **Gold Layer** (`tm2020_gold`): Analytics-ready tables with track spine enrichment
-
-See `notebooks/fabric_ghost_ingest.py` for the Silver ingestion notebook that creates:
-- `ghost_header` table: Metadata (one row per ghost)
-- `ghost_telemetry` table: Telemetry samples (52 fields, millions of rows)
-
-### Notebooks
-
-| Step | Notebook | Layer | What it does |
-|------|----------|-------|--------------|
-| 1 | `notebooks/fabric_replay_download.py` | Bronze | Download replay GBX files from Nadeo API |
-| 2 | `notebooks/fabric_ghost_ingest.py` | Silver | Parse GBX files → `silver_replay_header` + `silver_replay_telemetry` |
-| 3 | `notebooks/gold/05_build_gold_layer.py` | Gold | Build track spine + map all telemetry + enrich with calculated columns |
+| Module | Purpose |
+|--------|---------|
+| `tm_gbx.parser` | `parse_gbx()` entry point |
+| `tm_gbx.ghost` | `CPlugEntRecordData` → `CSceneVehicleVis` (107 bytes/sample) |
+| `tm_gbx.header` | Header chunk parsing |
+| `tm_gbx.reader` | Binary reading primitives |
+| `tm_gbx.lookback` | GBX string interning |
 
 ---
 
-## Gold Layer / Track Analysis
+## Getting Started
 
-The Gold layer transforms Silver telemetry into an analytics-ready star schema for Power BI.
-
-### Track Spine Concept
-
-For each map, the **fastest player run** is used as the reference racing line — the "track spine". Each point on that run gets a sequential surrogate key (`track_point_id`) and is tagged with a `checkpoint_section` derived from the replay's checkpoint crossing times. This creates a **spatial dimension**: _where_ on the track something happened, not _when_.
-
-### Why Space Over Time
-
-In racing, **time is a measure** (a fact), not a dimension:
-- Two players can be at 13.000 seconds into a race but at completely different track positions.
-- By mapping all telemetry rows to the nearest track spine point, we compare **what happened at the same place on the track**.
-- This enables: racing-line comparison, speed profiles by track position, braking-point analysis.
-
-### Distance Calculation
-
-| Column | Formula | Notes |
-|--------|---------|-------|
-| `distance_per_sample` | `speed × 0.05` | Speed × 50 ms window (Trackmania native units, not km/h) |
-| `cumulative_distance` | running sum of `distance_per_sample` per replay | Ordered by `time_ms` |
-| `distance_to_spine` | `sqrt((x-sx)²+(y-sy)²+(z-sz)²)` | How far the car is from the racing line at that point |
-
-### Checkpoint Section Optimisation
-
-Each replay's telemetry is tagged with `checkpoint_section` based on that replay's own checkpoint crossing times. Spatial matching only compares within the same checkpoint section, which:
-- Dramatically reduces computation (avoids a full cross-map join)
-- Provides a natural Power BI slicer: compare players' performance in specific track sections
-
-### Gold Tables
-
-| Table | Description | Key Columns |
-|-------|-------------|-------------|
-| `gold_replay_header` | Replay metadata (copy from Silver) | `replay_id`, `player_nickname`, `map_uid`, `race_time_ms`, `source` |
-| `gold_track_spine` | Track dimension — one row per spatial point per map | `track_point_id` (PK within map), `map_uid`, `checkpoint_section`, `x`, `y`, `z` |
-| `gold_replay_telemetry` | All telemetry mapped to track spine | All 52 fields + `track_point_id` (FK), `checkpoint_section`, `distance_to_spine`, `distance_per_sample`, `cumulative_distance` |
-
-### Power BI Data Model
-
-Star schema — connect to Gold tables only:
-
-```
-gold_replay_header ──1:*── gold_replay_telemetry ──*:1── gold_track_spine
-    (replay_id)              (replay_id, track_point_id)     (track_point_id unique per map_uid)
-```
-
-## Requirements
+### Prerequisites
 
 - Python 3.7+
-- Optional: `python-lzo>=1.14` for legacy replay files (not needed for `.Ghost.Gbx` files)
+- **Microsoft Fabric workspace** with Lakehouse (for the notebook pipeline)
+- **Ubisoft account** with Trackmania access (for Bronze download notebook)
+- **Trackmania OAuth app** credentials (for Silver nickname enrichment)
 
-## License
+### Run locally (parser only)
 
-See LICENSE file for details.
+```bash
+git clone https://github.com/villezekeviking/tm2020-gbx-parser.git
+cd tm2020-gbx-parser
+pip install -e .
+python examples/basic_usage.py
+```
+
+### Tests
+
+```bash
+python -m pytest tests/test_parser.py -v
+```
+
+---
 
 ## Credits
 
-- [gbx-net](https://github.com/BigBang1112/gbx-net) - C# GBX parser reference (CPlugEntRecordData, CSceneVehicleVis)
-- [pygbx](https://github.com/schadocalex/gbx.py) - Python GBX parser inspiration
+- [gbx-net](https://github.com/BigBang1112/gbx-net) — C# GBX parser reference (`CPlugEntRecordData`, `CSceneVehicleVis`)
+- [pygbx](https://github.com/schadocalex/gbx.py) — Python GBX parser inspiration
 

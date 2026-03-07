@@ -5,6 +5,11 @@ Connects to the Trackmania Nadeo API, fetches the top N leaderboard records
 for each map you specify, and downloads the .Replay.Gbx files into the
 Lakehouse Files area.
 
+In addition to the top N leaderboard entries, you can supply a list of
+tracked player Account IDs.  For each map the script will also look up
+those players' personal bests and download their replays (even if they
+are not in the top N).
+
 The downloaded replays land in:
   /lakehouse/default/Files/replays/leaderboard/{map_uid}/
 
@@ -16,10 +21,12 @@ Prerequisites:
 - Write access to /lakehouse/default/Files/
 
 Parameters (edit in Cell 1):
-- UBI_EMAIL      : Your Ubisoft account email
-- UBI_PASSWORD   : Your Ubisoft account password
-- MAP_UIDS       : List of map UIDs to fetch leaderboard replays for
-- TOP_N_PER_MAP  : How many top leaderboard entries to download per map
+- UBI_EMAIL             : Your Ubisoft account email
+- UBI_PASSWORD          : Your Ubisoft account password
+- MAP_UIDS              : List of map UIDs to fetch leaderboard replays for
+- TOP_N_PER_MAP         : How many top leaderboard entries to download per map
+- TRACKED_ACCOUNT_IDS   : Account IDs of players to always include (if they
+                          have a record on the map)
 """
 
 # ========================================
@@ -39,6 +46,13 @@ MAP_UIDS = [
 
 # How many top leaderboard entries to download per map (e.g. 5 or 10)
 TOP_N_PER_MAP = 5
+
+# Account IDs of players to always include (if they have a record on the map).
+# These are UUID-format strings like "36a476de-c712-45c4-b769-247b5dcb3f03".
+# Find account IDs on trackmania.io player profiles.
+TRACKED_ACCOUNT_IDS = [
+    # "36a476de-c712-45c4-b769-247b5dcb3f03",  # Example — replace with real ones
+]
 
 # Output folder in Lakehouse (leaderboard replays go under leaderboard/{map_uid}/)
 OUTPUT_BASE = "/lakehouse/default/Files/replays"
@@ -133,10 +147,15 @@ print("✓ NadeoServices token obtained")
 
 MAP_INFO_URL    = "https://prod.trackmania.core.nadeo.online/maps/"
 LEADERBOARD_URL = "https://live-services.trackmania.nadeo.live/api/token/leaderboard/group/Personal_Best/map/{map_uid}/top"
+SURROUND_URL    = "https://live-services.trackmania.nadeo.live/api/token/leaderboard/group/Personal_Best/map/{map_uid}/surround/0/0"
 MAP_RECORDS_URL = "https://prod.trackmania.core.nadeo.online/mapRecords/"
 
 # We'll collect all records to download across all maps here
 all_records_to_download = []
+
+# Counters for the summary
+tracked_found   = 0
+tracked_looked_up = 0
 
 for map_uid in MAP_UIDS:
     print(f"\n── Map UID: {map_uid}")
@@ -209,6 +228,79 @@ for map_uid in MAP_UIDS:
         })
 
     _time.sleep(0.6)
+
+    # --- Step D: Fetch records for tracked players not already in the top N ---
+    top_n_account_ids = set(account_ids)
+    players_to_look_up = [a for a in TRACKED_ACCOUNT_IDS if a not in top_n_account_ids]
+
+    for tracked_id in players_to_look_up:
+        tracked_looked_up += 1
+
+        try:
+            surround_response = requests.get(
+                SURROUND_URL.format(map_uid=map_uid),
+                params={"onlyWorld": "true", "accountIdList": tracked_id},
+                headers=LIVE_HEADERS,
+            )
+            surround_response.raise_for_status()
+            surround_tops = surround_response.json().get("tops", [])
+        except Exception as e:
+            print(f"  ✗ Surround lookup failed for {tracked_id}: {e}")
+            _time.sleep(0.6)
+            continue
+
+        surround_entries = surround_tops[0].get("top", []) if surround_tops else []
+
+        # Filter to just the tracked player (the surround may include neighbours)
+        player_entries = [e for e in surround_entries if e.get("accountId") == tracked_id]
+
+        if not player_entries:
+            print(f"  ⏭ Tracked player {tracked_id[:8]}... has no record on this map — skipping")
+            _time.sleep(0.6)
+            continue
+
+        player_entry = player_entries[0]
+        tracked_position = player_entry["position"]
+        tracked_score    = player_entry["score"]
+
+        _time.sleep(0.6)
+
+        # Fetch the replay URL for this player via the mapRecords endpoint
+        try:
+            tracked_rec_response = requests.get(
+                MAP_RECORDS_URL,
+                params={
+                    "mapIdList":     map_uuid,
+                    "accountIdList": tracked_id,
+                },
+                headers=CORE_HEADERS,
+            )
+            tracked_rec_response.raise_for_status()
+            tracked_records = tracked_rec_response.json()
+        except Exception as e:
+            print(f"  ✗ Map record lookup failed for tracked player {tracked_id[:8]}...: {e}")
+            _time.sleep(0.6)
+            continue
+
+        if not tracked_records:
+            print(f"  ⏭ No map record returned for tracked player {tracked_id[:8]}... — skipping")
+            _time.sleep(0.6)
+            continue
+
+        trec = tracked_records[0]
+        all_records_to_download.append({
+            "map_uid":    map_uid,
+            "map_uuid":   map_uuid,
+            "account_id": tracked_id,
+            "record_id":  trec.get("mapRecordId", ""),
+            "race_time":  tracked_score,
+            "replay_url": trec.get("url", ""),
+            "position":   tracked_position,
+        })
+        tracked_found += 1
+        print(f"  ✓ Tracked player {tracked_id[:8]}... found at position #{tracked_position} ({tracked_score / 1000:.3f}s)")
+
+        _time.sleep(0.6)
 
 print(f"\n✓ Total records to download: {len(all_records_to_download)}")
 
@@ -287,13 +379,14 @@ for rec in all_records_to_download:
 print("=" * 60)
 print("DOWNLOAD SUMMARY")
 print("=" * 60)
-print(f"Maps processed  : {len(MAP_UIDS)}")
-print(f"Top N per map   : {TOP_N_PER_MAP}")
-print(f"Records found   : {len(all_records_to_download)}")
-print(f"Downloaded      : {len(downloaded)}")
-print(f"Already existed : {len(skipped)}")
-print(f"Failed          : {len(failed)}")
-print(f"Output folder   : {OUTPUT_BASE}/leaderboard/")
+print(f"Maps processed       : {len(MAP_UIDS)}")
+print(f"Top N per map        : {TOP_N_PER_MAP}")
+print(f"Records found        : {len(all_records_to_download)}")
+print(f"Tracked players      : {len(TRACKED_ACCOUNT_IDS)} configured, {tracked_looked_up} looked up, {tracked_found} found")
+print(f"Downloaded           : {len(downloaded)}")
+print(f"Already existed      : {len(skipped)}")
+print(f"Failed               : {len(failed)}")
+print(f"Output folder        : {OUTPUT_BASE}/leaderboard/")
 print("=" * 60)
 
 if failed:

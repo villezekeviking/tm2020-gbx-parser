@@ -31,10 +31,10 @@ flowchart LR
 
 | Step | Notebook | Layer | What it does |
 |------|----------|-------|--------------|
-| 1 | `Bronze_01_replay_download` | Bronze | Authenticates with Ubisoft/Nadeo APIs, fetches leaderboard top N + tracked players, downloads `.Replay.Gbx` files |
-| 2 | `Silver_01_ghost_ingest` | Silver | Parses `.Gbx`/`.Ghost.Gbx` files → three Silver Delta tables |
+| 1 | `Bronze_01_replay_download` | Bronze | Authenticates with Ubisoft/Nadeo APIs, fetches leaderboard top N + tracked players, downloads `.Replay.Gbx` files; writes full map metadata to `_map_info.json` sidecars |
+| 2 | `Silver_01_ghost_ingest` | Silver | Parses `.Gbx`/`.Ghost.Gbx` files → three Silver Delta tables; also writes `silver_map` from `_map_info.json` sidecars |
 | 3 | `Silver_02_enrich_nicknames` | Silver | Batch-looks up Trackmania display names, MERGE-updates `silver_replay_header` |
-| 4 | `Gold_01_build_gold_layer` | Gold | Builds track spine, assigns checkpoint sections, spatially maps telemetry to spine, writes Gold tables |
+| 4 | `Gold_01_build_gold_layer` | Gold | Builds track spine, assigns checkpoint sections, spatially maps telemetry to spine, writes Gold tables including `gold_map` dimension |
 
 ### Notebook Data Flow
 
@@ -48,17 +48,20 @@ flowchart LR
     SRH[(silver_replay_header)]
     SRT[(silver_replay_telemetry)]
     SRC[(silver_replay_checkpoints)]
+    SM[(silver_map)]
     GRH[(gold_replay_header)]
     GTS[(gold_track_spine)]
     GTT[(gold_replay_telemetry)]
+    GM[(gold_map)]
 
     NAD --> B01
     B01 -->|.Replay.Gbx files| S01
-    S01 --> SRH & SRT & SRC
+    B01 -->|_map_info.json sidecars| S01
+    S01 --> SRH & SRT & SRC & SM
     SRH --> S02
     S02 --> SRH
-    SRH & SRT & SRC --> G01
-    G01 --> GRH & GTS & GTT
+    SRH & SRT & SRC & SM --> G01
+    G01 --> GRH & GTS & GTT & GM
 ```
 
 ---
@@ -70,9 +73,11 @@ flowchart LR
 | Silver | `silver_replay_header` | `replay_id`, `account_id`, `map_uid`, `race_time_ms` | One row per replay — metadata and player info |
 | Silver | `silver_replay_telemetry` | `replay_id`, `time_ms`, `x/y/z`, `speed` | One row per sample (52 fields at ~50 ms) |
 | Silver | `silver_replay_checkpoints` | `replay_id`, `cp_index`, `time_ms` | Checkpoint crossing times per replay |
+| Silver | `silver_map` | `map_uid`, `name`, `gold_score_ms`, `thumbnail_url` | One row per map — full map metadata from Nadeo API |
 | Gold | `gold_replay_header` | `replay_id`, `player_nickname`, `source` | Silver header copy + ingestion timestamp |
 | Gold | `gold_track_spine` | `track_point_id`, `map_uid`, `checkpoint_section`, `x/y/z` | Track dimension — spatial reference for each map |
 | Gold | `gold_replay_telemetry` | `replay_id`, `track_point_id`, `distance_to_spine` | All 52 fields mapped to spine + distance metrics |
+| Gold | `gold_map` | `map_uid`, `name`, `gold_score_ms`, `thumbnail_url` | Map dimension table — joins to `gold_replay_header` on `map_uid` |
 
 ---
 
@@ -106,13 +111,13 @@ flowchart LR
 
 ## Power BI Data Model
 
-Connect Power BI to the three Gold tables only.
+Connect Power BI to the Gold tables only.
 
 ```mermaid
 erDiagram
     gold_replay_header {
         string replay_id PK
-        string map_uid
+        string map_uid FK
         string player_nickname
         int race_time_ms
     }
@@ -133,8 +138,17 @@ erDiagram
         float y
         float z
     }
+    gold_map {
+        string map_uid PK
+        string name
+        int gold_score_ms
+        int silver_score_ms
+        int bronze_score_ms
+        string thumbnail_url
+    }
     gold_replay_header ||--o{ gold_replay_telemetry : "replay_id"
     gold_replay_telemetry }o--|| gold_track_spine : "track_point_id"
+    gold_map ||--o{ gold_replay_header : "map_uid"
 ```
 
 ---

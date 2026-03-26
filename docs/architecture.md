@@ -126,6 +126,26 @@ This document describes the Microsoft Fabric Lakehouse architecture for TrackMan
 - `first_seen` (timestamp)
 - `last_seen` (timestamp)
 
+**Table: `silver_map`** *(map metadata from Nadeo API)*
+- `map_uid` (string, PK)
+- `map_id` (string) — internal Nadeo UUID
+- `name` (string)
+- `author_id` (string) — account UUID
+- `submitter_id` (string) — account UUID
+- `author_score_ms` (integer)
+- `gold_score_ms` (integer)
+- `silver_score_ms` (integer)
+- `bronze_score_ms` (integer)
+- `collection_name` (string) — e.g. "Stadium"
+- `map_type` (string)
+- `map_style` (string)
+- `filename` (string)
+- `uploaded_at` (string) — ISO timestamp
+- `thumbnail_url` (string)
+- `file_url` (string)
+- `is_playable` (boolean)
+- `ingested_at` (timestamp)
+
 **Table: `silver_players`**
 - `player_login` (string, PK)
 - `player_nickname` (string)
@@ -169,6 +189,27 @@ This document describes the Microsoft Fabric Lakehouse architecture for TrackMan
 - `min_time_ms` (integer)
 - `max_time_ms` (integer)
 - `sample_count` (integer)
+
+**Table: `gold_map`** *(map dimension for Power BI star schema)*
+- `map_uid` (string, PK) — joins to `gold_replay_header.map_uid`
+- `map_id` (string)
+- `name` (string)
+- `author_id` (string)
+- `submitter_id` (string)
+- `author_score_ms` (integer)
+- `gold_score_ms` (integer)
+- `silver_score_ms` (integer)
+- `bronze_score_ms` (integer)
+- `collection_name` (string)
+- `map_type` (string)
+- `map_style` (string)
+- `filename` (string)
+- `uploaded_at` (string)
+- `thumbnail_url` (string)
+- `file_url` (string)
+- `is_playable` (boolean)
+- `ingested_at` (timestamp)
+- `ingested_to_gold_at` (timestamp)
 
 ## Naming Conventions
 
